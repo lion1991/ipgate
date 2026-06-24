@@ -3,15 +3,10 @@
 **/target
 Cargo.lock.bak
 
-# Tauri / client
-client/src-tauri/target
-client/node_modules
-client/dist
-client/.tauri
-
-# 移动端构建产物
-client/src-tauri/gen/apple/build
-client/src-tauri/gen/android/app/build
+# 客户端：整个 client/ 不进本(公开)仓库——公开仓库只放 agent 源码。
+# client/README.md 已被跟踪，保留为公开文档；客户端其余源码用 client/ 下的
+# 独立本地 git 仓库管理（不配 remote，绝不会 push 到公开 origin）。
+/client/
 
 # 凭据 / 本地配置（切勿提交）
 *.pem
