@@ -1,0 +1,47 @@
+name: release
+
+# 打 v* tag 即构建静态 musl 二进制，并发到 GitHub Release。
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build (static musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p ipgate-agent
+
+      - name: Package deploy bundle
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/ipgate-agent
+          strip "$BIN"
+          mkdir -p stage/ipgate-agent
+          cp "$BIN" stage/ipgate-agent/ipgate-agent
+          cp agent/deploy/install.sh agent/deploy/uninstall.sh \
+             agent/deploy/ipgate-agent.service agent/deploy/config.example.json \
+             stage/ipgate-agent/
+          chmod +x stage/ipgate-agent/*.sh
+          tar -C stage -czf ipgate-agent-x86_64-unknown-linux-musl.tar.gz ipgate-agent
+          cp "$BIN" ipgate-agent-x86_64-unknown-linux-musl
+          sha256sum ipgate-agent-x86_64-unknown-linux-musl* > SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ipgate-agent-x86_64-unknown-linux-musl
+            ipgate-agent-x86_64-unknown-linux-musl.tar.gz
+            SHA256SUMS
+          generate_release_notes: true
