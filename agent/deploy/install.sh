@@ -8,12 +8,16 @@
 #   curl -fsSL https://raw.githubusercontent.com/lion1991/ipgate/main/agent/deploy/install.sh | sudo bash
 #
 #   # 或下载后运行：
-#   sudo ./install.sh [--version vX.Y.Z] [--repo owner/name] [--binary <path>] [--yes]
+#   sudo ./install.sh [--version vX.Y.Z] [--repo owner/name] [--binary <path>] [--allow IP] [--yes]
 #
 #   --version   指定版本（默认 latest）
 #   --repo      指定仓库（默认 lion1991/ipgate，或 $IPGATE_REPO）
 #   --binary    用本地二进制，跳过下载（离线/整包安装）
+#   --allow     额外放行一个管理来源 IP（防自锁；可叠加在自动探测之上）
 #   --yes / -y  跳过所有交互确认（无人值守）
+#
+# 注：sudo 默认会清掉 SSH_CONNECTION，脚本已用扫进程环境/who 的方式找回 SSH 来源 IP；
+#     若仍探测不到（如 curl|bash 无 tty），用 --allow 指定，或 `sudo -E` 保留环境。
 #
 set -euo pipefail
 
@@ -27,6 +31,7 @@ VERSION="${IPGATE_VERSION:-latest}"
 BIN_SRC=""
 TMP_BIN=""
 ASSUME_YES=0
+ALLOW_EXTRA=""
 
 log()  { printf '\033[1;32m[ipgate]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[ipgate] 警告:\033[0m %s\n' "$*" >&2; }
@@ -63,11 +68,27 @@ sha256_of() {
   else echo ""; fi
 }
 
+# 收集需放行的管理来源 IP（防自锁）。sudo 会清掉 SSH_CONNECTION/SSH_CLIENT，
+# 故 root 时再扫进程环境找回；叠加 who 与 --allow。去重、剔除空与本地显示 :0。
+collect_admin_ips() {
+  {
+    [ -n "${SSH_CONNECTION:-}" ] && awk '{print $1}' <<<"$SSH_CONNECTION"
+    [ -n "${SSH_CLIENT:-}" ]     && awk '{print $1}' <<<"$SSH_CLIENT"
+    if [ "$(id -u)" = 0 ]; then
+      for f in /proc/*/environ; do tr '\0' '\n' <"$f" 2>/dev/null; done \
+        | sed -n 's/^SSH_CONNECTION=//p' | awk '{print $1}'
+    fi
+    who 2>/dev/null | sed -n 's/.*(\([0-9A-Fa-f:.]*\)).*/\1/p'
+    [ -n "$ALLOW_EXTRA" ] && printf '%s\n' "$ALLOW_EXTRA"
+  } | grep -vE '^$|^:0' | sort -u
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --binary)  BIN_SRC="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
     --repo)    REPO="$2"; shift 2 ;;
+    --allow)   ALLOW_EXTRA="$2"; shift 2 ;;
     --yes|-y)  ASSUME_YES=1; shift ;;
     *) die "未知参数: $1" ;;
   esac
@@ -169,22 +190,24 @@ fi
 mkdir -p "$DATA_DIR"
 chmod 0700 "$DATA_DIR"
 
-# --- 防自锁：把当前 SSH 来源 IP 加入放行名单 ---
-# default-drop 一旦生效，除管理端口/established/名单/公开端口外一律拒，含 SSH！
-if [ -n "${SSH_CONNECTION:-}" ]; then
-  admin_ip="$(awk '{print $1}' <<<"$SSH_CONNECTION")"
-  case "$admin_ip" in
-    *:*) cidr="$admin_ip/128" ;;
-    *)   cidr="$admin_ip/32"  ;;
-  esac
-  warn "default-drop 启用后仅放行名单内的源 IP 可访问（含 SSH）。"
-  warn "你正从 $admin_ip 经 SSH 连接——将把它加入放行名单以防自锁。"
-  "$PREFIX/ipgate-agent" --config "$CONF_DIR/config.json" allow "$cidr" --note "installer: SSH client" \
-    && log "已放行 $cidr"
+# --- 防自锁：把管理来源 IP（SSH 等）加入放行名单 ---
+# default-drop 一旦生效，除管理端口/established/名单/公开端口外一律拒新建连接，含 SSH！
+admin_ips="$(collect_admin_ips)"
+if [ -n "$admin_ips" ]; then
+  warn "default-drop 启用后仅放行名单内的源 IP 可新建连接（含 SSH）。"
+  while IFS= read -r aip; do
+    [ -z "$aip" ] && continue
+    case "$aip" in *:*) c="$aip/128" ;; *) c="$aip/32" ;; esac
+    if "$PREFIX/ipgate-agent" --config "$CONF_DIR/config.json" allow "$c" --note "installer: admin/SSH"; then
+      log "已放行管理来源 $c"
+    else
+      warn "跳过无法识别的来源: $aip"
+    fi
+  done <<<"$admin_ips"
 else
-  warn "未检测到 SSH 连接（本地控制台?）。启动后只有管理端口 19186 可达；"
-  warn "如需保留其它入站访问，先用: ipgate-agent allow <你的IP>/32"
-  warn "若这台机器对外提供 Web 等服务，务必先把 80/443 等端口写进 config.json 的 public_tcp！"
+  warn "未能自动识别管理来源 IP（sudo 清掉了 SSH_CONNECTION、curl|bash 无 tty、或本地控制台）。"
+  warn "为防自锁：用 --allow <你的IP> 指定，或 sudo -E 重跑，或装完立即 ipgate-agent allow <IP>/32。"
+  warn "若本机对外提供 Web 等服务，务必把 80/443 写进 config.json 的 public_tcp！"
   confirm "了解风险并继续?" || die "已取消。"
 fi
 
