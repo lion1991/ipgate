@@ -54,3 +54,12 @@ pub struct Allowlist {
     /// 单调递增修订号，用于客户端缓存失效与并发检测。
     pub revision: u64,
 }
+
+/// `GET /v1/whoami` 响应：agent 实际观测到的客户端来源 IP。
+///
+/// 这就是 nftables 将要匹配的源地址（客户端经 NAT/出口后的外部 IP），
+/// 比客户端自测公网 IP 更可信——直接取自本条 TLS 连接的对端地址。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WhoamiResponse {
+    pub ip: std::net::IpAddr,
+}

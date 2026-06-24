@@ -40,6 +40,7 @@ pub fn router(state: AppState) -> Router {
                 .post(handlers::allow)
                 .delete(handlers::revoke),
         )
+        .route("/v1/whoami", get(handlers::whoami))
         .route("/v1/sync", post(handlers::sync))
         .route("/v1/devices", get(handlers::list_devices))
         .route("/v1/devices/{id}", delete(handlers::revoke_device))
@@ -54,8 +55,10 @@ pub async fn serve(state: AppState, identity: ServerIdentity, addr: SocketAddr) 
         identity.key_pem.into_bytes(),
     )
     .await?;
+    // into_make_service_with_connect_info：让 handler 能经 ConnectInfo 拿到对端地址
+    // （/v1/whoami 用它回报客户端来源 IP）。
     axum_server::bind_rustls(addr, tls)
-        .serve(router(state).into_make_service())
+        .serve(router(state).into_make_service_with_connect_info::<SocketAddr>())
         .await?;
     Ok(())
 }

@@ -4,7 +4,7 @@ use super::error::{internal, ApiResult, AppError};
 use super::AppState;
 use crate::auth::{challenge, keys, pairing, token};
 use crate::reconcile;
-use axum::extract::{FromRequestParts, Path, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, State};
 use axum::http::request::Parts;
 use axum::http::{header::AUTHORIZATION, StatusCode};
 use axum::Json;
@@ -12,8 +12,9 @@ use chrono::{Duration, Utc};
 use ipgate_proto::{
     AllowRequest, Allowlist, AuthChallengeRequest, AuthChallengeResponse, AuthVerifyRequest,
     AuthVerifyResponse, Device, DeviceId, Diff, Entry, ErrorCode, PairRequest, PairResponse,
-    RevokeRequest, SessionToken, SESSION_TOKEN_TTL_SECS,
+    RevokeRequest, SessionToken, WhoamiResponse, SESSION_TOKEN_TTL_SECS,
 };
+use std::net::SocketAddr;
 
 /// 已鉴权设备：从 `Authorization: Bearer <token>` 验出。
 pub struct AuthDevice(pub DeviceId);
@@ -183,6 +184,15 @@ pub async fn revoke(
         .remove(&target)
         .map_err(|e| AppError::new(ErrorCode::NftFailure, e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 回报 agent 在本条 TLS 连接上观测到的客户端来源 IP（即 nftables 会匹配的地址）。
+/// agent 直接 bind_rustls 监听、无反代，对端地址即客户端外部 IP。
+pub async fn whoami(
+    _auth: AuthDevice,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> ApiResult<Json<WhoamiResponse>> {
+    Ok(Json(WhoamiResponse { ip: peer.ip() }))
 }
 
 pub async fn sync(State(st): State<AppState>, _auth: AuthDevice) -> ApiResult<Json<Diff>> {

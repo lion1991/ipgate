@@ -118,6 +118,45 @@ fn json<T: serde::Serialize>(v: &T) -> Option<Vec<u8>> {
     Some(serde_json::to_vec(v).unwrap())
 }
 
+/// 配对 + 登录，返回可用的 Bearer 令牌。
+async fn pair_and_login(
+    h: &Harness,
+    sk: &ed25519_dalek::SigningKey,
+    pubkey: &PublicKey,
+) -> String {
+    let code = pairing::create(&h.data_dir, PAIRING_CODE_TTL_SECS, Utc::now()).unwrap();
+    let pair_req = PairRequest {
+        pairing_code: code.clone(),
+        device_name: "phone".into(),
+        device_pubkey: pubkey.clone(),
+        signature: testkit::sign(sk, &pairing::pair_message(&code)),
+    };
+    let (_, body) = call(&h.app, "POST", "/v1/pair", None, json(&pair_req)).await;
+    let paired: PairResponse = serde_json::from_slice(&body).unwrap();
+
+    let (_, body) = call(
+        &h.app,
+        "POST",
+        "/v1/auth/challenge",
+        None,
+        json(&AuthChallengeRequest {
+            device_id: paired.device_id,
+        }),
+    )
+    .await;
+    let chal: AuthChallengeResponse = serde_json::from_slice(&body).unwrap();
+    let verify_req = AuthVerifyRequest {
+        device_id: paired.device_id,
+        signature: testkit::sign(sk, &challenge::auth_message(&chal.nonce, &h.fingerprint)),
+    };
+    let (_, body) = call(&h.app, "POST", "/v1/auth/verify", None, json(&verify_req)).await;
+    serde_json::from_slice::<AuthVerifyResponse>(&body)
+        .unwrap()
+        .token
+        .as_str()
+        .to_owned()
+}
+
 #[tokio::test]
 async fn full_pairing_and_allowlist_flow() {
     let h = harness();
@@ -208,6 +247,42 @@ async fn full_pairing_and_allowlist_flow() {
     let devices: Vec<Device> = serde_json::from_slice(&body).unwrap();
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].name, "phone");
+
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn whoami_reports_observed_peer_ip() {
+    let h = harness();
+    let (sk, pubkey) = testkit::keypair(7);
+    let bearer = pair_and_login(&h, &sk, &pubkey).await;
+
+    // oneshot 不经真实 socket，手动注入 ConnectInfo 模拟对端地址。
+    let addr: std::net::SocketAddr = "203.0.113.9:54321".parse().unwrap();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/whoami")
+        .header("authorization", format!("Bearer {bearer}"))
+        .extension(axum::extract::ConnectInfo(addr))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let who: WhoamiResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(who.ip, addr.ip());
+
+    // 未鉴权应被拒
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/whoami")
+        .extension(axum::extract::ConnectInfo(addr))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
