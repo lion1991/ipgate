@@ -14,6 +14,7 @@
 #   --repo      指定仓库（默认 lion1991/ipgate，或 $IPGATE_REPO）
 #   --binary    用本地二进制，跳过下载（离线/整包安装）
 #   --allow     额外放行一个管理来源 IP（防自锁；可叠加在自动探测之上）
+#   --force     即使已是目标版本也强制重新下载安装
 #   --yes / -y  跳过所有交互确认（无人值守）
 #
 # 注：sudo 默认会清掉 SSH_CONNECTION，脚本已用扫进程环境/who 的方式找回 SSH 来源 IP；
@@ -25,13 +26,20 @@ PREFIX=/usr/local/bin
 CONF_DIR=/etc/ipgate
 DATA_DIR=/var/lib/ipgate
 UNIT_DST=/etc/systemd/system/ipgate-agent.service
-SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo /tmp)"
+# 经 curl|bash 管道运行时 $0 是 "bash"（非文件）→ SCRIPT_DIR 置空，不在 cwd 找二进制，
+# 强制走下载（否则会误用 cwd 里残留的旧二进制）。下载/整包(./install.sh)两种场景都正确。
+if [ -f "$0" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+else
+  SCRIPT_DIR=""
+fi
 REPO="${IPGATE_REPO:-lion1991/ipgate}"
 VERSION="${IPGATE_VERSION:-latest}"
 BIN_SRC=""
 TMP_BIN=""
 ASSUME_YES=0
 ALLOW_EXTRA=""
+FORCE=0
 
 log()  { printf '\033[1;32m[ipgate]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[ipgate] 警告:\033[0m %s\n' "$*" >&2; }
@@ -68,19 +76,31 @@ sha256_of() {
   else echo ""; fi
 }
 
+# 解析 latest 实际指向的 tag（走 releases/latest 的重定向，不耗 API 配额）。失败返回空。
+resolve_latest_tag() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSLI -o /dev/null -w '%{url_effective}\n' \
+      "https://github.com/$REPO/releases/latest" 2>/dev/null | sed -n 's#.*/releases/tag/##p'
+  else
+    wget -q -S -O /dev/null "https://github.com/$REPO/releases/latest" 2>&1 \
+      | sed -n 's#.*[Ll]ocation:.*/releases/tag/##p' | tail -n1
+  fi
+}
+
 # 收集需放行的管理来源 IP（防自锁）。sudo 会清掉 SSH_CONNECTION/SSH_CLIENT，
 # 故 root 时再扫进程环境找回；叠加 who 与 --allow。去重、剔除空与本地显示 :0。
 collect_admin_ips() {
+  # 在命令替换的子shell里跑：关掉 errexit/pipefail，容忍 /proc 进程退出竞态、grep 无匹配。
+  set +e +o pipefail
   {
     [ -n "${SSH_CONNECTION:-}" ] && awk '{print $1}' <<<"$SSH_CONNECTION"
     [ -n "${SSH_CLIENT:-}" ]     && awk '{print $1}' <<<"$SSH_CLIENT"
-    if [ "$(id -u)" = 0 ]; then
-      for f in /proc/*/environ; do tr '\0' '\n' <"$f" 2>/dev/null; done \
-        | sed -n 's/^SSH_CONNECTION=//p' | awk '{print $1}'
-    fi
+    # sudo 清掉环境变量 → root 扫进程环境找回；cat 一把抓，2>/dev/null 容忍文件瞬时消失。
+    [ "$(id -u)" = 0 ] && cat /proc/*/environ 2>/dev/null | tr '\0' '\n' \
+      | sed -n 's/^SSH_CONNECTION=//p' | awk '{print $1}'
     who 2>/dev/null | sed -n 's/.*(\([0-9A-Fa-f:.]*\)).*/\1/p'
     [ -n "$ALLOW_EXTRA" ] && printf '%s\n' "$ALLOW_EXTRA"
-  } | grep -vE '^$|^:0' | sort -u
+  } 2>/dev/null | grep -vE '^$|^:0' | sort -u
 }
 
 while [ $# -gt 0 ]; do
@@ -89,6 +109,7 @@ while [ $# -gt 0 ]; do
     --version) VERSION="$2"; shift 2 ;;
     --repo)    REPO="$2"; shift 2 ;;
     --allow)   ALLOW_EXTRA="$2"; shift 2 ;;
+    --force)   FORCE=1; shift ;;
     --yes|-y)  ASSUME_YES=1; shift ;;
     *) die "未知参数: $1" ;;
   esac
@@ -138,15 +159,38 @@ download_binary() {
   BIN_SRC="$TMP_BIN"
 }
 
-# --- 定位二进制：--binary > 脚本同目录 > 下载 ---
-if [ -z "$BIN_SRC" ]; then
+# --- 定位二进制：--binary > 脚本同目录 > （版本判断后）下载 ---
+if [ -z "$BIN_SRC" ] && [ -n "$SCRIPT_DIR" ]; then
   for cand in "$SCRIPT_DIR/ipgate-agent" "$SCRIPT_DIR/$ASSET" \
               "$SCRIPT_DIR/ipgate-agent-x86_64-unknown-linux-musl" \
               "$SCRIPT_DIR/ipgate-agent-aarch64-unknown-linux-musl"; do
     [ -f "$cand" ] && { BIN_SRC="$cand"; log "使用同目录二进制 $cand"; break; }
   done
 fi
-[ -z "$BIN_SRC" ] && download_binary
+
+if [ -z "$BIN_SRC" ]; then
+  # 没有本地二进制 → 走下载，但先判断「是否真有更新」。
+  target="$VERSION"
+  [ "$target" = latest ] && target="$(resolve_latest_tag)"
+  installed=""
+  if [ -x "$PREFIX/ipgate-agent" ]; then
+    iv="$("$PREFIX/ipgate-agent" -V 2>/dev/null | awk '{print $2}')"
+    [ -n "$iv" ] && installed="v$iv"
+  fi
+  if [ "$FORCE" != 1 ] && [ -n "$target" ] && [ "$installed" = "$target" ]; then
+    log "已是最新版本 $installed —— 无更新，跳过。（--force 可强制重装）"
+    # 确保服务在跑（升级判断为"无更新"也顺手把停掉的服务拉起来）。
+    systemctl is-active --quiet ipgate-agent.service 2>/dev/null \
+      || systemctl restart ipgate-agent.service 2>/dev/null || true
+    exit 0
+  fi
+  if [ -n "$installed" ]; then
+    log "当前 ${installed}，目标 ${target:-latest} → 开始更新。"
+  else
+    log "未安装 → 安装 ${target:-latest}。"
+  fi
+  download_binary
+fi
 [ -n "$BIN_SRC" ] && [ -f "$BIN_SRC" ] || die "找不到也下载不到 ipgate-agent 二进制。"
 
 # --- 前置检查 ---
