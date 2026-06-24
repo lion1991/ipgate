@@ -1,0 +1,6 @@
+# ipgate Cargo workspace。
+# proto = 共享协议类型；agent = 远程主机服务端。
+# client（Tauri）后续加入 members。
+[workspace]
+resolver = "2"
+members = ["proto", "agent"]

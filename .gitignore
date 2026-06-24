@@ -1,0 +1,23 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+
+# Tauri / client
+client/src-tauri/target
+client/node_modules
+client/dist
+client/.tauri
+
+# 移动端构建产物
+client/src-tauri/gen/apple/build
+client/src-tauri/gen/android/app/build
+
+# 凭据 / 本地配置（切勿提交）
+*.pem
+*.key
+.env
+.env.local
+
+# OS
+.DS_Store

@@ -1,0 +1,7 @@
+{
+  "bind": "0.0.0.0:19186",
+  "mgmt_port": 19186,
+  "public_tcp": [],
+  "public_udp": [],
+  "data_dir": "/var/lib/ipgate"
+}

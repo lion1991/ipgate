@@ -1,0 +1,34 @@
+name: build-agent
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Test (proto + agent)
+        run: cargo test --workspace
+
+      - name: Build agent (static musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p ipgate-agent
+
+      - name: Strip
+        run: strip target/x86_64-unknown-linux-musl/release/ipgate-agent
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipgate-agent-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/ipgate-agent
+          if-no-files-found: error

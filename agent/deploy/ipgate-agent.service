@@ -1,0 +1,29 @@
+[Unit]
+Description=ipgate agent — nftables 放行名单管理（default-drop）
+Documentation=https://github.com/your-org/ipgate
+# 防火墙提前：在网卡配置前建立 default-drop，关闭暴露窗口（同 ufw/firewalld 做法）。
+Wants=network-pre.target
+Before=network-pre.target
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ipgate-agent --config /etc/ipgate/config.json run
+Restart=on-failure
+RestartSec=2
+# 启动即应用 ruleset；失败（如 nft 报错）则退出非 0 → 重启重试。
+TimeoutStartSec=30
+
+# --- 加硬（root 下仍尽量收敛）---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ipgate
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+# nft 需要 netlink，default-drop 需操作内核防火墙，故地址族必须放行 AF_NETLINK。
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

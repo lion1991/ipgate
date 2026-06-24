@@ -1,0 +1,15 @@
+[package]
+name = "ipgate-proto"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "ipgate 客户端与 agent 共享的协议类型（单一可信源）。见 ../docs/adr/0001..0003。"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+ipnet = { version = "2", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+serde_json = "1"
