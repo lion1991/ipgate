@@ -52,29 +52,59 @@ fn render_ports(ports: &[PortRange]) -> String {
         .join(", ")
 }
 
-/// 渲染完整的原子事务（喂给 `nft -f -`）：幂等重建 table/set/chain 并载入当前条目。
+/// 渲染一个 set 定义；元素**内联**在定义里（`elements = {...}`）。
+///
+/// 内联而非用单独的 `add element` 语句：老版本 nft（如 el7 的 0.8）不认同一份
+/// `-f` 文件里对刚定义的 set 做 `add element`（"Set does not exist"），内联在新旧版本都可用。
+fn set_def(name: &str, typ: &str, flags: &str, elements: &str) -> String {
+    if elements.is_empty() {
+        format!("    set {name} {{ type {typ}; flags {flags}; }}\n")
+    } else {
+        format!("    set {name} {{ type {typ}; flags {flags}; elements = {{ {elements} }} }}\n")
+    }
+}
+
+/// 渲染完整的原子事务（喂给 `nft -f <file>`）：幂等重建 table/set/chain 并载入当前条目。
 ///
 /// 「确保存在 → 删除 → 重建」是 nftables 的标准幂等重置惯用法，整份在一个事务里，
 /// 因此 default-drop 与管理端口放行**同时**生效，绝无中间窗口。
 pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) -> String {
     let t = table();
-    let mut s = String::new();
 
+    // 先算出各 set 的元素，内联进 set 定义（见 set_def 说明）。
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for e in entries {
+        if e.is_expired(now) {
+            continue;
+        }
+        let tok = element_token(&e.target, e.expires_at, now);
+        match e.target {
+            IpNet::V4(_) => v4.push(tok),
+            IpNet::V6(_) => v6.push(tok),
+        }
+    }
+    let tcp = render_ports(&cfg.public_tcp);
+    let udp = render_ports(&cfg.public_udp);
+
+    let mut s = String::new();
     s.push_str(&format!("table {t}\n"));
     s.push_str(&format!("delete table {t}\n"));
     s.push_str(&format!("table {t} {{\n"));
-    s.push_str(&format!(
-        "    set {NFT_SET_ALLOW4} {{ type ipv4_addr; flags interval, timeout; }}\n"
+    s.push_str(&set_def(
+        NFT_SET_ALLOW4,
+        "ipv4_addr",
+        "interval, timeout",
+        &v4.join(", "),
     ));
-    s.push_str(&format!(
-        "    set {NFT_SET_ALLOW6} {{ type ipv6_addr; flags interval, timeout; }}\n"
+    s.push_str(&set_def(
+        NFT_SET_ALLOW6,
+        "ipv6_addr",
+        "interval, timeout",
+        &v6.join(", "),
     ));
-    s.push_str(&format!(
-        "    set {NFT_SET_PUBLIC_TCP} {{ type inet_service; flags interval; }}\n"
-    ));
-    s.push_str(&format!(
-        "    set {NFT_SET_PUBLIC_UDP} {{ type inet_service; flags interval; }}\n"
-    ));
+    s.push_str(&set_def(NFT_SET_PUBLIC_TCP, "inet_service", "interval", &tcp));
+    s.push_str(&set_def(NFT_SET_PUBLIC_UDP, "inet_service", "interval", &udp));
     s.push_str("    chain input {\n");
     // 用数字 priority 0（= filter），兼容老版本 nft（命名优先级 0.9+ 才支持）。
     s.push_str("        type filter hook input priority 0; policy drop;\n");
@@ -95,40 +125,6 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
     s.push_str(&format!("        ip6 saddr @{NFT_SET_ALLOW6} accept\n"));
     s.push_str("    }\n");
     s.push_str("}\n");
-
-    // 在同一事务内载入当前条目（避免 default-drop 下名单短暂为空）。
-    let mut v4 = Vec::new();
-    let mut v6 = Vec::new();
-    for e in entries {
-        if e.is_expired(now) {
-            continue;
-        }
-        let tok = element_token(&e.target, e.expires_at, now);
-        match e.target {
-            IpNet::V4(_) => v4.push(tok),
-            IpNet::V6(_) => v6.push(tok),
-        }
-    }
-    if !v4.is_empty() {
-        s.push_str(&format!(
-            "add element {t} {NFT_SET_ALLOW4} {{ {} }}\n",
-            v4.join(", ")
-        ));
-    }
-    if !v6.is_empty() {
-        s.push_str(&format!(
-            "add element {t} {NFT_SET_ALLOW6} {{ {} }}\n",
-            v6.join(", ")
-        ));
-    }
-    let tcp = render_ports(&cfg.public_tcp);
-    if !tcp.is_empty() {
-        s.push_str(&format!("add element {t} {NFT_SET_PUBLIC_TCP} {{ {tcp} }}\n"));
-    }
-    let udp = render_ports(&cfg.public_udp);
-    if !udp.is_empty() {
-        s.push_str(&format!("add element {t} {NFT_SET_PUBLIC_UDP} {{ {udp} }}\n"));
-    }
     s
 }
 
@@ -202,8 +198,9 @@ mod tests {
             entry("198.51.100.9/32", Some(past)), // 已过期 → 不应出现
         ];
         let s = render_apply(&RulesetConfig::default(), &entries, now);
-        assert!(s.contains("add element inet ipgate allow4 { 203.0.113.0/24 }"));
-        assert!(s.contains("add element inet ipgate allow6 { 2001:db8::/32 }"));
+        // 元素内联在 set 定义里
+        assert!(s.contains("set allow4 { type ipv4_addr; flags interval, timeout; elements = { 203.0.113.0/24 } }"));
+        assert!(s.contains("set allow6 { type ipv6_addr; flags interval, timeout; elements = { 2001:db8::/32 } }"));
         assert!(!s.contains("198.51.100.9"));
     }
 
@@ -230,6 +227,6 @@ mod tests {
             public_udp: vec![],
         };
         let s = render_apply(&cfg, &[], Utc::now());
-        assert!(s.contains("add element inet ipgate public_tcp { 443, 8000-8010 }"));
+        assert!(s.contains("set public_tcp { type inet_service; flags interval; elements = { 443, 8000-8010 } }"));
     }
 }
