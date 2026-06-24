@@ -224,7 +224,9 @@ UNIT
   log "未找到 ipgate-agent.service，已写入内置 unit"
 fi
 systemctl daemon-reload
-systemctl enable --now ipgate-agent.service
+systemctl enable ipgate-agent.service >/dev/null 2>&1 || true
+# 用 restart 而非 enable --now：无论之前是否在跑，都拉起新二进制 —— 重复运行脚本 = 原地升级。
+systemctl restart ipgate-agent.service
 
 sleep 1
 if systemctl is-active --quiet ipgate-agent.service; then
@@ -234,7 +236,15 @@ else
 fi
 
 echo
-log "生成首个配对码（供客户端入网）:"
-"$PREFIX/ipgate-agent" --config "$CONF_DIR/config.json" pair || true
+# 已有配对设备 = 升级场景，不再生成新配对码；否则首装，打印一个。
+dev_count="$("$PREFIX/ipgate-agent" --config "$CONF_DIR/config.json" status 2>/dev/null \
+  | sed -n 's/.*设备：\([0-9]*\).*/\1/p')"
+[ -z "$dev_count" ] && dev_count=0
+if [ "$dev_count" -gt 0 ] 2>/dev/null; then
+  log "升级完成（已有 $dev_count 个已配对设备，无需重新配对）。"
+else
+  log "生成首个配对码（供客户端入网）:"
+  "$PREFIX/ipgate-agent" --config "$CONF_DIR/config.json" pair || true
+fi
 echo
 log "完成。校验 ruleset: nft list table inet ipgate"
