@@ -1,6 +1,6 @@
 [Unit]
 Description=ipgate agent — nftables 放行名单管理（default-drop）
-Documentation=https://github.com/your-org/ipgate
+Documentation=https://github.com/lion1991/ipgate
 # 防火墙提前：在网卡配置前建立 default-drop，关闭暴露窗口（同 ufw/firewalld 做法）。
 Wants=network-pre.target
 Before=network-pre.target

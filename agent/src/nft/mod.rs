@@ -8,7 +8,7 @@ mod parse;
 mod ruleset;
 
 pub use cli::NftCli;
-pub use parse::parse_set_elements;
+pub use parse::{parse_set_elements, parse_set_elements_text};
 pub use ruleset::{add_element_script, delete_element_script, render_apply};
 
 use ipgate_proto::{Entry, KernelElement, RulesetConfig};

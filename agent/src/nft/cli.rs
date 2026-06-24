@@ -1,7 +1,8 @@
 //! `nft` 子进程后端：[`NftBackend`] 的真实实现。
 
 use super::{
-    add_element_script, delete_element_script, parse_set_elements, render_apply, NftBackend,
+    add_element_script, delete_element_script, parse_set_elements, parse_set_elements_text,
+    render_apply, NftBackend,
 };
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -49,7 +50,8 @@ impl NftCli {
         Ok(())
     }
 
-    fn run_json(&self, args: &[&str]) -> Result<String> {
+    /// 跑一条 `nft` 命令并捕获 stdout（用于读取/list）。
+    fn run_capture(&self, args: &[&str]) -> Result<String> {
         let out = Command::new(&self.bin)
             .args(args)
             .output()
@@ -86,8 +88,14 @@ impl NftBackend for NftCli {
         let now = Utc::now();
         let mut all = Vec::new();
         for set in [NFT_SET_ALLOW4, NFT_SET_ALLOW6] {
-            let json = self.run_json(&["-j", "list", "set", "inet", NFT_TABLE, set])?;
-            all.extend(parse_set_elements(&json, now)?);
+            match self.run_capture(&["-j", "list", "set", "inet", NFT_TABLE, set]) {
+                Ok(json) => all.extend(parse_set_elements(&json, now)?),
+                // 老 nft（el7 的 0.8）不认 `-j` → 退化解析纯文本输出。
+                Err(_) => {
+                    let text = self.run_capture(&["list", "set", "inet", NFT_TABLE, set])?;
+                    all.extend(parse_set_elements_text(&text, now)?);
+                }
+            }
         }
         Ok(all)
     }
