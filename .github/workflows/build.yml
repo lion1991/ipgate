@@ -17,6 +17,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: musl
+
       - name: Test (proto + agent)
         run: cargo test --workspace
 

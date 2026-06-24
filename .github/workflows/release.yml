@@ -20,6 +20,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: musl
+
+      # 用 tag 名作为二进制版本（去掉前缀 v），使 `ipgate-agent -V` 与 release 一致。
+      # 放在缓存恢复之后：缓存键基于原 Cargo.lock，命中后仅 agent 重编，依赖走缓存。
+      - name: Set version from tag
+        run: sed -i "s/^version = .*/version = \"${GITHUB_REF_NAME#v}\"/" agent/Cargo.toml
+
       - name: Build (static musl)
         run: cargo build --release --target x86_64-unknown-linux-musl -p ipgate-agent
 
