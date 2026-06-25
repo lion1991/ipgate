@@ -10,6 +10,15 @@ use ipgate_proto::{Entry, KernelElement, RulesetConfig, NFT_SET_ALLOW4, NFT_SET_
 use ipnet::IpNet;
 use std::process::Command;
 
+/// 保证脚本以单个换行终止（满足 nft `-f` 解析器；已以 \n 结尾则原样返回）。
+fn with_trailing_newline(script: &str) -> String {
+    if script.ends_with('\n') {
+        script.to_owned()
+    } else {
+        format!("{script}\n")
+    }
+}
+
 /// 通过 `nft` 命令行操作内核（ADR 0002）。绝不经过 shell，杜绝注入。
 pub struct NftCli {
     bin: String,
@@ -35,7 +44,11 @@ impl NftCli {
             "ipgate-nft-{}.nft",
             crate::util::to_hex(&crate::util::random_bytes::<8>())
         ));
-        crate::util::write_private(&path, script.as_bytes())
+        // nft 的 -f 解析器要求语句以换行终止，否则末尾语句报
+        // "unexpected end of file, expecting comma or '}'"。整表 apply 本就以 \n 结尾，
+        // 但增量 add/delete/flush 是单行无换行 —— 这里统一补上。
+        let content = with_trailing_newline(script);
+        crate::util::write_private(&path, content.as_bytes())
             .with_context(|| format!("写临时 ruleset 失败: {}", path.display()))?;
         let out = Command::new(&self.bin)
             .arg("-f")
@@ -102,5 +115,25 @@ impl NftBackend for NftCli {
 
     fn flush(&self) -> Result<()> {
         self.run_script(&format!("delete table inet {NFT_TABLE}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_script_gets_newline_terminated() {
+        // 复现 bug：增量 add 脚本本身无换行，喂给 nft -f 会 EOF 报错；补换行后修复。
+        let raw = add_element_script(&"221.212.111.66/32".parse().unwrap(), None, Utc::now());
+        assert!(!raw.ends_with('\n'), "脚本生成器仍是纯单行");
+        assert_eq!(with_trailing_newline(&raw), format!("{raw}\n"));
+    }
+
+    #[test]
+    fn existing_newline_not_doubled() {
+        // apply 整表已以 \n 结尾，不应再加。
+        assert_eq!(with_trailing_newline("table inet ipgate {\n}\n"), "table inet ipgate {\n}\n");
+        assert_eq!(with_trailing_newline("x"), "x\n");
     }
 }
