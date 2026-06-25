@@ -67,7 +67,9 @@ Android 端日后
 - [x] 桌面骨架 + Rust 核心(TLS 固定 / 配对 / 登录 / 名单增删 / 设备 / 同步)
 - [x] 主机管理 + 配对向导 UI
 - [x] iOS 脚手架(`tauri ios init`)+ 响应式移动 UI,模拟器跑通
-- [ ] 移动端密钥改存 Keychain / Keystore(现为 app data JSON)
-- [ ] Android 接入(`tauri android init`)
+- [x] 适配 agent 管理端口访问密钥门(默认头带密钥 + join 串拆分 + 设置/更新密钥免重配对)
+- [x] 设备私钥种子改存安全存储(Apple=Keychain;其余暂 0600 文件)+ 旧版明文一次性迁移;iOS 模拟器验证读写/迁移
+- [ ] Android 接入(`tauri android init`)+ 种子改存 Android Keystore
+- [ ] 桌面(Windows/Linux)种子改存系统密钥库(现为 0600 文件)
 - [ ] 实时同步(WebSocket,待 agent 侧加)
 - [ ] 签名 happy-path 的真实端到端联调(对真机 agent)
