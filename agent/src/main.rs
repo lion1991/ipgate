@@ -6,8 +6,11 @@
 mod api;
 mod auth;
 mod config;
+mod forward;
+mod netinfo;
 mod nft;
 mod reconcile;
+mod resolve;
 mod store;
 mod tls;
 mod util;
@@ -20,9 +23,12 @@ use auth::AuthState;
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand};
 use config::AgentConfig;
-use ipgate_proto::{AllowRequest, DeviceId, PAIRING_CODE_TTL_SECS};
+use ipgate_proto::{
+    AddForwardRequest, AllowRequest, DeviceId, ForwardId, ForwardProto, ForwardSource, PortRange,
+    PAIRING_CODE_TTL_SECS,
+};
 use ipnet::IpNet;
-use nft::{NftBackend, NftCli};
+use nft::{NatBackend, NftBackend, NftCli};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -72,6 +78,33 @@ enum Cmd {
         #[arg(long)]
         reset: bool,
     },
+    /// 列出端口转发规则（存储态 + 当前解析 IP）。
+    Forwards,
+    /// 新增/更新端口转发（离线写存储 + 尽力即时落地）。同 `(网卡, 监听端口)` 覆盖。
+    ForwardAdd {
+        /// 本地监听端口或区间，如 443 或 8000-8010。
+        #[arg(long)]
+        listen: String,
+        /// 目标 host:port，如 10.0.0.9:8443 或 ex.com:9000-9010（host 可为域名）。
+        #[arg(long)]
+        dest: String,
+        /// 协议：tcp | udp | both。
+        #[arg(long, default_value = "tcp")]
+        proto: String,
+        /// 入口网卡；缺省用默认路由网卡。
+        #[arg(long)]
+        iface: Option<String>,
+        /// SNAT 源：auto 或具体 IPv4。
+        #[arg(long, default_value = "auto")]
+        source: String,
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// 删除端口转发（按 id，见 `forwards` 输出）。
+    ForwardRm {
+        /// 规则 id（uuid）。
+        id: String,
+    },
     /// 打印将要应用的 nftables ruleset（不改内核，便于审计）。
     PrintRuleset,
     /// 显示存储条目与内核 set 当前状态。
@@ -113,6 +146,16 @@ fn main() -> Result<()> {
                 eprintln!("注意：require_access_key=false，当前未强制此密钥（端口仍匿名可达）。");
             }
         }
+        Cmd::Forwards => forwards_cli(&cfg)?,
+        Cmd::ForwardAdd {
+            listen,
+            dest,
+            proto,
+            iface,
+            source,
+            note,
+        } => forward_add_cli(&cfg, &listen, &dest, &proto, iface, &source, &note)?,
+        Cmd::ForwardRm { id } => forward_rm_cli(&cfg, &id)?,
         Cmd::PrintRuleset => {
             let store = Store::load(&cfg.store_path())?;
             print!(
@@ -192,6 +235,171 @@ fn revoke_cli(cfg: &AgentConfig, target: &str) -> Result<()> {
     Ok(())
 }
 
+// ---- 端口转发 CLI（离线/装机/排障；运行中的服务请走客户端 API）----
+//
+// 与 allow/revoke 同样的离线语义：CLI 写的是**磁盘存储**，运行中的服务进程看不到，
+// 且其周期循环会以自己的内存态覆盖。本组命令仅供服务**未运行**时（装机/调试）使用。
+
+fn parse_port_range(s: &str) -> Result<PortRange> {
+    let s = s.trim();
+    let pr = if let Some((a, b)) = s.split_once('-') {
+        let start: u16 = a.trim().parse().with_context(|| format!("非法端口: {a}"))?;
+        let end: u16 = b.trim().parse().with_context(|| format!("非法端口: {b}"))?;
+        PortRange { start, end }
+    } else {
+        let p: u16 = s.parse().with_context(|| format!("非法端口: {s}"))?;
+        PortRange::single(p)
+    };
+    if pr.start == 0 || !pr.is_valid() {
+        anyhow::bail!("非法端口区间: {s}");
+    }
+    Ok(pr)
+}
+
+fn parse_proto(s: &str) -> Result<ForwardProto> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "tcp" => Ok(ForwardProto::Tcp),
+        "udp" => Ok(ForwardProto::Udp),
+        "both" | "tcp+udp" | "all" => Ok(ForwardProto::Both),
+        other => anyhow::bail!("非法协议（tcp|udp|both）: {other}"),
+    }
+}
+
+fn parse_source(s: &str) -> Result<ForwardSource> {
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+        Ok(ForwardSource::Auto)
+    } else {
+        let ip: std::net::Ipv4Addr = s.parse().with_context(|| format!("非法源 IPv4: {s}"))?;
+        Ok(ForwardSource::Ip(ip))
+    }
+}
+
+fn fmt_ports(p: &PortRange) -> String {
+    if p.start == p.end {
+        p.start.to_string()
+    } else {
+        format!("{}-{}", p.start, p.end)
+    }
+}
+
+fn proto_label(p: ForwardProto) -> &'static str {
+    match p {
+        ForwardProto::Tcp => "tcp",
+        ForwardProto::Udp => "udp",
+        ForwardProto::Both => "tcp+udp",
+    }
+}
+
+fn forwards_cli(cfg: &AgentConfig) -> Result<()> {
+    let store = Store::load(&cfg.store_path())?;
+    println!(
+        "端口转发规则：{}（修订 {}）",
+        store.forwards().len(),
+        store.forward_revision()
+    );
+    for f in store.forwards() {
+        let iface = f.iface.clone().unwrap_or_else(|| "auto".into());
+        let src = match f.source {
+            ForwardSource::Auto => "auto".to_string(),
+            ForwardSource::Ip(ip) => ip.to_string(),
+        };
+        let resolved = store
+            .resolved_ip(f.id)
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "未解析".into());
+        println!(
+            "  [{}] {} :{} → {}:{}  源={} 解析={}  id={}",
+            proto_label(f.proto),
+            iface,
+            fmt_ports(&f.listen),
+            f.dest_host,
+            fmt_ports(&f.dest_port),
+            src,
+            resolved,
+            f.id
+        );
+    }
+    Ok(())
+}
+
+fn forward_add_cli(
+    cfg: &AgentConfig,
+    listen: &str,
+    dest: &str,
+    proto: &str,
+    iface: Option<String>,
+    source: &str,
+    note: &str,
+) -> Result<()> {
+    let listen = parse_port_range(listen)?;
+    let (host, dport) = dest
+        .rsplit_once(':')
+        .context("目标需 host:port 形式，如 10.0.0.9:8443")?;
+    let dest_port = parse_port_range(dport)?;
+    let req = AddForwardRequest {
+        proto: parse_proto(proto)?,
+        iface,
+        listen,
+        dest_host: host.trim().to_string(),
+        dest_port,
+        source: parse_source(source)?,
+        note: note.to_string(),
+    };
+    ipgate_proto::validate_ports(&req.listen, &req.dest_port).map_err(|e| anyhow::anyhow!(e))?;
+    if req.dest_host.is_empty() {
+        anyhow::bail!("目标主机为空");
+    }
+
+    let store = Arc::new(Mutex::new(Store::load(&cfg.store_path())?));
+    let rule = {
+        let mut s = store.lock().unwrap();
+        let r = s.add_forward(req, DeviceId(Uuid::nil()), Utc::now());
+        s.save()?;
+        r
+    };
+    // 尽力即时落地（装机期把转发拉起）。失败不致命：已写存储，服务启动会接管。
+    let nat: Arc<dyn NatBackend + Send + Sync> = Arc::new(NftCli::new());
+    match forward::apply_now(&store, &nat) {
+        Ok((_, warns)) => {
+            for w in warns {
+                eprintln!("提示: {w}");
+            }
+        }
+        Err(e) => eprintln!("已写存储，但即时落地失败（服务运行后会自动同步）: {e}"),
+    }
+    println!(
+        "已添加转发 [{}] :{} → {}:{}",
+        proto_label(rule.proto),
+        fmt_ports(&rule.listen),
+        rule.dest_host,
+        fmt_ports(&rule.dest_port)
+    );
+    println!("  id={}", rule.id);
+    Ok(())
+}
+
+fn forward_rm_cli(cfg: &AgentConfig, id: &str) -> Result<()> {
+    let id = ForwardId(Uuid::parse_str(id.trim()).context("非法 id（应为 uuid）")?);
+    let store = Arc::new(Mutex::new(Store::load(&cfg.store_path())?));
+    let removed = {
+        let mut s = store.lock().unwrap();
+        let r = s.remove_forward(id);
+        if r {
+            s.save()?;
+        }
+        r
+    };
+    if !removed {
+        println!("无此转发规则: {id}");
+        return Ok(());
+    }
+    let nat: Arc<dyn NatBackend + Send + Sync> = Arc::new(NftCli::new());
+    let _ = forward::apply_now(&store, &nat);
+    println!("已删除转发 {id}");
+    Ok(())
+}
+
 fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
     cfg.validate()?;
     // rustls（tls-rustls-no-provider）需要进程级 crypto provider。
@@ -201,6 +409,7 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
     info!(fingerprint = %identity.fingerprint, "服务端 TLS 指纹（首次连接请核对）");
 
     let backend: Arc<dyn NftBackend + Send + Sync> = Arc::new(NftCli::new());
+    let nat: Arc<dyn NatBackend + Send + Sync> = Arc::new(NftCli::new());
     let store = Arc::new(Mutex::new(Store::load(&cfg.store_path())?));
 
     // 启动即清过期 + 全量原子重建（坐实 default-drop 与管理端口放行不变量）。
@@ -212,6 +421,20 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
         backend.apply(&cfg.ruleset(), s.entries())?;
     }
     info!("ruleset 已应用");
+
+    // 端口转发：启动期解析 + 落地一次（独立 `ip ipgate_nat` 表，与上面互不相干）。
+    match forward::apply_now(&store, &nat) {
+        Ok((n, warns)) => {
+            for w in &warns {
+                warn!("转发：{w}");
+            }
+            if n > 0 {
+                info!(applied = n, "端口转发已应用");
+            }
+        }
+        // 转发落地失败绝不拖垮主服务（放行名单/管理端口才是命脉）：记日志、继续。
+        Err(e) => warn!(error = %e, "端口转发启动落地失败（不影响放行名单与管理端口）"),
+    }
 
     let auth = Arc::new(AuthState::load_or_generate(&cfg.data_dir)?);
     if !cfg.require_access_key {
@@ -227,12 +450,18 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
         let (store, backend, cfg) = (store.clone(), backend.clone(), cfg.clone());
         std::thread::spawn(move || reconcile_loop(cfg, store, backend, interval));
     }
+    // 端口转发周期重解析线程（域名 IP 漂移自愈，独立于对账）。
+    {
+        let (store, nat) = (store.clone(), nat.clone());
+        std::thread::spawn(move || forward::resolve_loop(store, nat, interval));
+    }
 
     let addr = cfg.bind;
     let state = api::AppState {
         cfg: cfg.clone(),
         store,
         backend,
+        nat,
         auth,
         fingerprint: identity.fingerprint.clone(),
         require_access_key: cfg.require_access_key,

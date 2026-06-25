@@ -8,7 +8,7 @@ pub use limit::RateLimiter;
 
 use crate::auth::AuthState;
 use crate::config::AgentConfig;
-use crate::nft::NftBackend;
+use crate::nft::{NatBackend, NftBackend};
 use crate::store::Store;
 use crate::tls::ServerIdentity;
 use anyhow::Result;
@@ -32,6 +32,8 @@ pub struct AppState {
     pub cfg: Arc<AgentConfig>,
     pub store: Arc<Mutex<Store>>,
     pub backend: Arc<dyn NftBackend + Send + Sync>,
+    /// 端口转发落地后端（`ip ipgate_nat` 表）。
+    pub nat: Arc<dyn NatBackend + Send + Sync>,
     pub auth: Arc<AuthState>,
     /// 本服务端 SPKI 指纹（登录挑战绑定信道用）。
     pub fingerprint: SpkiFingerprint,
@@ -57,6 +59,13 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/whoami", get(handlers::whoami))
         .route("/v1/sync", post(handlers::sync))
+        // 端口转发（独立 `ip ipgate_nat` 表）
+        .route(
+            "/v1/forwards",
+            get(handlers::list_forwards).post(handlers::add_forward),
+        )
+        .route("/v1/forwards/{id}", delete(handlers::remove_forward))
+        .route("/v1/interfaces", get(handlers::list_interfaces))
         .route("/v1/devices", get(handlers::list_devices))
         .route("/v1/devices/{id}", delete(handlers::revoke_device))
         .with_state(state.clone());

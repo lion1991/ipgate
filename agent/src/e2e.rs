@@ -5,7 +5,7 @@ use crate::api::{router, AppState};
 use crate::auth::keys::testkit;
 use crate::auth::{challenge, pairing, AuthState};
 use crate::config::AgentConfig;
-use crate::nft::NftBackend;
+use crate::nft::{NatBackend, NftBackend, ResolvedForward};
 use crate::store::Store;
 use crate::tls;
 use crate::util::{random_bytes, to_hex};
@@ -56,6 +56,23 @@ impl NftBackend for MockNft {
     }
 }
 
+/// 内存版转发后端：只记录最近一次落地的规则数，供断言。
+#[derive(Default)]
+struct MockNat {
+    applied: Mutex<Vec<ResolvedForward>>,
+}
+
+impl NatBackend for MockNat {
+    fn apply_nat(&self, forwards: &[ResolvedForward]) -> anyhow::Result<()> {
+        *self.applied.lock().unwrap() = forwards.to_vec();
+        Ok(())
+    }
+    fn flush_nat(&self) -> anyhow::Result<()> {
+        self.applied.lock().unwrap().clear();
+        Ok(())
+    }
+}
+
 struct Harness {
     app: Router,
     backend: Arc<MockNft>,
@@ -88,6 +105,7 @@ fn harness_cfg(require_access_key: bool) -> Harness {
         cfg: Arc::new(cfg),
         store,
         backend: backend.clone(),
+        nat: Arc::new(MockNat::default()),
         auth,
         fingerprint: identity.fingerprint.clone(),
         require_access_key,
@@ -261,6 +279,92 @@ async fn full_pairing_and_allowlist_flow() {
     let devices: Vec<Device> = serde_json::from_slice(&body).unwrap();
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].name, "phone");
+
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+/// 端口转发 CRUD 走通：列表 → 新增（校验）→ 落地 → 删除。
+///
+/// 注：测试机无 `ip`/`nft`，`apply_now` 会把规则当「无法解析网卡 IP」跳过，故只断言
+/// HTTP/存储/serde 这一层（路由、鉴权、校验、修订号、删除），不断言内核生效。
+#[tokio::test]
+async fn forward_crud_flow() {
+    let h = harness();
+    let (sk, pubkey) = testkit::keypair(101);
+    let bearer = pair_and_login(&h, &sk, &pubkey).await;
+
+    // 未鉴权被拒
+    let (st, _) = call(&h.app, "GET", "/v1/forwards", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // 初始为空
+    let (st, body) = call(&h.app, "GET", "/v1/forwards", Some(&bearer), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let list: ForwardList = serde_json::from_slice(&body).unwrap();
+    assert!(list.forwards.is_empty());
+    assert_eq!(list.revision, 0);
+
+    // 端口区间长度不一致 → 400
+    let bad = AddForwardRequest {
+        proto: ForwardProto::Tcp,
+        iface: Some("eth0".into()),
+        listen: PortRange { start: 8000, end: 8010 },
+        dest_host: "10.0.0.9".into(),
+        dest_port: PortRange { start: 9000, end: 9005 },
+        source: ForwardSource::Auto,
+        note: String::new(),
+    };
+    let (st, _) = call(&h.app, "POST", "/v1/forwards", Some(&bearer), json(&bad)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // 合法新增（字面 IP 目标）
+    let req = AddForwardRequest {
+        proto: ForwardProto::Both,
+        iface: Some("eth0".into()),
+        listen: PortRange::single(443),
+        dest_host: "10.0.0.9".into(),
+        dest_port: PortRange::single(8443),
+        source: ForwardSource::Auto,
+        note: "web".into(),
+    };
+    let (st, body) = call(&h.app, "POST", "/v1/forwards", Some(&bearer), json(&req)).await;
+    assert_eq!(st, StatusCode::OK);
+    let view: ForwardView = serde_json::from_slice(&body).unwrap();
+    assert_eq!(view.rule.dest_host, "10.0.0.9");
+    assert_eq!(view.rule.proto, ForwardProto::Both);
+    let id = view.rule.id;
+
+    // 列表可读到该条，修订号 +1
+    let (_, body) = call(&h.app, "GET", "/v1/forwards", Some(&bearer), None).await;
+    let list: ForwardList = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list.forwards.len(), 1);
+    assert_eq!(list.revision, 1);
+    assert_eq!(list.forwards[0].rule.id, id);
+
+    // 删除不存在 → 404
+    let (st, _) = call(
+        &h.app,
+        "DELETE",
+        &format!("/v1/forwards/{}", ForwardId::new()),
+        Some(&bearer),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // 删除该条 → 204，列表回空
+    let (st, _) = call(
+        &h.app,
+        "DELETE",
+        &format!("/v1/forwards/{id}"),
+        Some(&bearer),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (_, body) = call(&h.app, "GET", "/v1/forwards", Some(&bearer), None).await;
+    let list: ForwardList = serde_json::from_slice(&body).unwrap();
+    assert!(list.forwards.is_empty());
 
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }

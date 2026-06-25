@@ -10,8 +10,9 @@ use axum::http::{header::AUTHORIZATION, StatusCode};
 use axum::Json;
 use chrono::{Duration, Utc};
 use ipgate_proto::{
-    AllowRequest, Allowlist, AuthChallengeRequest, AuthChallengeResponse, AuthVerifyRequest,
-    AuthVerifyResponse, Device, DeviceId, Diff, Entry, ErrorCode, PairRequest, PairResponse,
+    validate_ports, AddForwardRequest, AllowRequest, Allowlist, AuthChallengeRequest,
+    AuthChallengeResponse, AuthVerifyRequest, AuthVerifyResponse, Device, DeviceId, Diff, Entry,
+    ErrorCode, ForwardId, ForwardList, ForwardView, InterfaceInfo, PairRequest, PairResponse,
     RevokeRequest, SessionToken, WhoamiResponse, SESSION_TOKEN_TTL_SECS,
 };
 use std::net::SocketAddr;
@@ -203,6 +204,92 @@ pub async fn sync(State(st): State<AppState>, _auth: AuthDevice) -> ApiResult<Js
         .map_err(|e| AppError::new(ErrorCode::NftFailure, e.to_string()))?;
     let store = st.store.lock().unwrap();
     Ok(Json(reconcile::diff(store.entries(), &kernel, now)))
+}
+
+// ---- 端口转发（独立 `ip ipgate_nat` 表）----
+
+/// 构造单条转发的客户端视图：附上当前解析 IP 与是否生效。
+fn forward_view(store: &crate::store::Store, rule: ipgate_proto::ForwardRule) -> ForwardView {
+    let resolved_ip = store.resolved_ip(rule.id);
+    ForwardView {
+        rule,
+        resolved_ip,
+        // 有解析到 IP 即视作已落地（apply 失败不回写缓存，故缓存有值=上次落地成功含本条）。
+        active: resolved_ip.is_some(),
+    }
+}
+
+pub async fn list_forwards(
+    State(st): State<AppState>,
+    _auth: AuthDevice,
+) -> ApiResult<Json<ForwardList>> {
+    let store = st.store.lock().unwrap();
+    let forwards = store
+        .forwards()
+        .iter()
+        .cloned()
+        .map(|r| forward_view(&store, r))
+        .collect();
+    Ok(Json(ForwardList {
+        forwards,
+        revision: store.forward_revision(),
+    }))
+}
+
+pub async fn add_forward(
+    State(st): State<AppState>,
+    auth: AuthDevice,
+    Json(req): Json<AddForwardRequest>,
+) -> ApiResult<Json<ForwardView>> {
+    validate_ports(&req.listen, &req.dest_port)
+        .map_err(|e| AppError::new(ErrorCode::BadRequest, e))?;
+    if req.dest_host.trim().is_empty() {
+        return Err(AppError::new(ErrorCode::BadRequest, "目标主机为空"));
+    }
+
+    let now = Utc::now();
+    let rule = {
+        let mut store = st.store.lock().unwrap();
+        let rule = store.add_forward(req, auth.0, now);
+        store.save().map_err(internal)?;
+        rule
+    };
+    let id = rule.id;
+
+    // 立即解析 + 落地（best-effort：解析失败的条目会被跳过、留待周期循环重试）。
+    // 落地真失败（nft 报错）才回报 NftFailure——但规则已持久化，对账/重解析会补。
+    crate::forward::apply_now(&st.store, &st.nat)
+        .map_err(|e| AppError::new(ErrorCode::NftFailure, e.to_string()))?;
+
+    let store = st.store.lock().unwrap();
+    Ok(Json(forward_view(&store, rule_by_id(&store, id).unwrap_or(rule))))
+}
+
+/// 落地后重新取一遍规则（拿到最新 resolved 状态）。
+fn rule_by_id(store: &crate::store::Store, id: ForwardId) -> Option<ipgate_proto::ForwardRule> {
+    store.find_forward(id).cloned()
+}
+
+pub async fn remove_forward(
+    State(st): State<AppState>,
+    _auth: AuthDevice,
+    Path(id): Path<ForwardId>,
+) -> ApiResult<StatusCode> {
+    {
+        let mut store = st.store.lock().unwrap();
+        if !store.remove_forward(id) {
+            return Err(AppError::new(ErrorCode::NotFound, "转发规则不存在"));
+        }
+        store.save().map_err(internal)?;
+    }
+    crate::forward::apply_now(&st.store, &st.nat)
+        .map_err(|e| AppError::new(ErrorCode::NftFailure, e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 列主机网卡（客户端做下拉 + 源 IP 提示）。
+pub async fn list_interfaces(_auth: AuthDevice) -> ApiResult<Json<Vec<InterfaceInfo>>> {
+    Ok(Json(crate::netinfo::interfaces()))
 }
 
 pub async fn list_devices(

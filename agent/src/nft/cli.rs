@@ -2,7 +2,7 @@
 
 use super::{
     add_element_script, delete_element_script, parse_set_elements, parse_set_elements_text,
-    render_apply, NftBackend,
+    render_apply, render_nat_apply, render_nat_flush, NatBackend, NftBackend, ResolvedForward,
 };
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -115,6 +115,16 @@ impl NftBackend for NftCli {
 
     fn flush(&self) -> Result<()> {
         self.run_script(&format!("delete table inet {NFT_TABLE}"))
+    }
+}
+
+impl NatBackend for NftCli {
+    fn apply_nat(&self, forwards: &[ResolvedForward]) -> Result<()> {
+        self.run_script(&render_nat_apply(forwards))
+    }
+
+    fn flush_nat(&self) -> Result<()> {
+        self.run_script(&render_nat_flush())
     }
 }
 

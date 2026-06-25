@@ -10,6 +10,7 @@ pub mod auth;
 pub mod crypto;
 pub mod entry;
 pub mod error;
+pub mod forward;
 pub mod ids;
 pub mod ruleset;
 
@@ -17,6 +18,7 @@ pub use auth::*;
 pub use crypto::*;
 pub use entry::*;
 pub use error::*;
+pub use forward::*;
 pub use ids::*;
 pub use ruleset::*;
 
@@ -36,6 +38,12 @@ pub const NFT_SET_ALLOW6: &str = "allow6";
 pub const NFT_SET_PUBLIC_TCP: &str = "public_tcp";
 /// 对全世界开放的 UDP 端口 set 名。
 pub const NFT_SET_PUBLIC_UDP: &str = "public_udp";
+
+/// 端口转发用的**独立** nftables 表（`ip` family，仅 IPv4）。
+///
+/// 与放行名单的 `inet ipgate` 表彻底隔离：转发的 DNAT/SNAT 逻辑就算渲染出错、
+/// 被 `delete table` 重建，也碰不到 `inet ipgate` 里的管理端口放行不变量。
+pub const NFT_NAT_TABLE: &str = "ipgate_nat";
 
 /// 会话令牌默认有效期（秒）。
 pub const SESSION_TOKEN_TTL_SECS: u64 = 15 * 60;
