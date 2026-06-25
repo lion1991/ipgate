@@ -1,6 +1,6 @@
 [package]
 name = "ipgate-agent"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 publish = false
 description = "ipgate agent —— 运行在远程 Linux 主机上，落地 nftables 放行名单（ADR 0002）。"
