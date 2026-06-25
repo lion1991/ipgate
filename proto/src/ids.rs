@@ -37,3 +37,7 @@ uuid_newtype!(
     /// 放行名单条目 id。
     EntryId
 );
+uuid_newtype!(
+    /// 端口转发规则 id。
+    ForwardId
+);

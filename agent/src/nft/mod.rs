@@ -4,10 +4,12 @@
 //! 业务逻辑只依赖 [`NftBackend`] trait，便于日后换 netlink 实现。
 
 mod cli;
+mod nat;
 mod parse;
 mod ruleset;
 
 pub use cli::NftCli;
+pub use nat::{render_nat_apply, render_nat_flush, ResolvedForward};
 pub use parse::{parse_set_elements, parse_set_elements_text};
 pub use ruleset::{add_element_script, delete_element_script, render_apply};
 
@@ -31,4 +33,15 @@ pub trait NftBackend {
     fn list(&self) -> anyhow::Result<Vec<KernelElement>>;
     /// 卸载：删除整张 `inet ipgate` 表。
     fn flush(&self) -> anyhow::Result<()>;
+}
+
+/// 端口转发落地后端（独立于 [`NftBackend`]，对应 `ip ipgate_nat` 表）。
+///
+/// 与放行名单分两个 trait：转发是**整表全量重建**（规则少、且 DNS 重解析后需整体换），
+/// 与放行名单的增量 add/remove 语义不同；分开也保证两张表互不耦合。
+pub trait NatBackend {
+    /// 原子全量应用：重建 `ip ipgate_nat` 表并载入所有（已解析的）转发规则。
+    fn apply_nat(&self, forwards: &[ResolvedForward]) -> anyhow::Result<()>;
+    /// 清空：删除整张 `ip ipgate_nat` 表（无转发时）。
+    fn flush_nat(&self) -> anyhow::Result<()>;
 }

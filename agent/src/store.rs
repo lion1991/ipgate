@@ -4,17 +4,30 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use ipgate_proto::{AllowRequest, Device, DeviceId, Entry, EntryId};
+use ipgate_proto::{
+    AddForwardRequest, AllowRequest, Device, DeviceId, Entry, EntryId, ForwardId, ForwardRule,
+};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct State {
     pub entries: Vec<Entry>,
     pub devices: Vec<Device>,
-    /// 单调递增修订号。
+    /// 放行名单单调递增修订号。
     pub revision: u64,
+    /// 端口转发规则（独立于放行名单）。
+    #[serde(default)]
+    pub forwards: Vec<ForwardRule>,
+    /// 端口转发单调递增修订号（与 `revision` 各自独立）。
+    #[serde(default)]
+    pub forward_revision: u64,
+    /// 上次成功解析的转发目标 IP（域名解析失败时回退用，对齐动态域名诉求）。
+    #[serde(default)]
+    pub resolved: HashMap<ForwardId, Ipv4Addr>,
 }
 
 pub struct Store {
@@ -118,6 +131,68 @@ impl Store {
         removed
     }
 
+    // ---- 端口转发（独立于放行名单，落地 `ip ipgate_nat` 表）----
+
+    pub fn forwards(&self) -> &[ForwardRule] {
+        &self.state.forwards
+    }
+
+    pub fn forward_revision(&self) -> u64 {
+        self.state.forward_revision
+    }
+
+    pub fn find_forward(&self, id: ForwardId) -> Option<&ForwardRule> {
+        self.state.forwards.iter().find(|f| f.id == id)
+    }
+
+    /// 新增转发；同 `(iface, listen)` 的旧规则被覆盖（避免同端口多条冲突的 DNAT）。
+    pub fn add_forward(
+        &mut self,
+        req: AddForwardRequest,
+        by: DeviceId,
+        now: DateTime<Utc>,
+    ) -> ForwardRule {
+        self.state
+            .forwards
+            .retain(|f| !(f.iface == req.iface && f.listen == req.listen));
+        let rule = ForwardRule {
+            id: ForwardId::new(),
+            proto: req.proto,
+            iface: req.iface,
+            listen: req.listen,
+            dest_host: req.dest_host,
+            dest_port: req.dest_port,
+            source: req.source,
+            note: req.note,
+            created_at: now,
+            created_by: by,
+        };
+        self.state.forwards.push(rule.clone());
+        self.state.forward_revision += 1;
+        rule
+    }
+
+    pub fn remove_forward(&mut self, id: ForwardId) -> bool {
+        let before = self.state.forwards.len();
+        self.state.forwards.retain(|f| f.id != id);
+        let removed = self.state.forwards.len() != before;
+        if removed {
+            self.state.resolved.remove(&id);
+            self.state.forward_revision += 1;
+        }
+        removed
+    }
+
+    /// 上次成功解析到的目标 IP（域名解析失败时的回退源）。
+    pub fn resolved_ip(&self, id: ForwardId) -> Option<Ipv4Addr> {
+        self.state.resolved.get(&id).copied()
+    }
+
+    /// 整体替换解析缓存（调用方已把「解析失败时沿用旧值」合并进 map）。
+    pub fn set_resolved(&mut self, map: HashMap<ForwardId, Ipv4Addr>) {
+        self.state.resolved = map;
+    }
+
     /// 删除所有已过期条目，返回被删目标。
     pub fn prune_expired(&mut self, now: DateTime<Utc>) -> Vec<IpNet> {
         let mut removed = Vec::new();
@@ -198,6 +273,54 @@ mod tests {
         let removed = s.prune_expired(now);
         assert_eq!(removed, vec!["192.0.2.1/32".parse::<IpNet>().unwrap()]);
         assert_eq!(s.entries().len(), 1);
+    }
+
+    fn fwd_req(listen: u16, host: &str, iface: Option<&str>) -> AddForwardRequest {
+        use ipgate_proto::{ForwardProto, ForwardSource, PortRange};
+        AddForwardRequest {
+            proto: ForwardProto::Tcp,
+            iface: iface.map(|s| s.to_string()),
+            listen: PortRange::single(listen),
+            dest_host: host.to_string(),
+            dest_port: PortRange::single(listen),
+            source: ForwardSource::Auto,
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn add_forward_dedupes_same_iface_and_listen() {
+        let mut s = temp_store();
+        let by = DeviceId::new();
+        let now = Utc::now();
+        s.add_forward(fwd_req(443, "a.com", Some("eth0")), by, now);
+        // 同 (iface, listen) 覆盖
+        let r = s.add_forward(fwd_req(443, "b.com", Some("eth0")), by, now);
+        assert_eq!(s.forwards().len(), 1);
+        assert_eq!(s.forwards()[0].dest_host, "b.com");
+        assert_eq!(s.forward_revision(), 2);
+
+        // 不同网卡同端口并存
+        s.add_forward(fwd_req(443, "c.com", Some("eth1")), by, now);
+        assert_eq!(s.forwards().len(), 2);
+
+        assert!(s.remove_forward(r.id));
+        assert_eq!(s.forwards().len(), 1);
+        assert!(!s.remove_forward(r.id));
+    }
+
+    #[test]
+    fn resolved_cache_roundtrips() {
+        let mut s = temp_store();
+        let r = s.add_forward(fwd_req(80, "x.com", None), DeviceId::new(), Utc::now());
+        assert_eq!(s.resolved_ip(r.id), None);
+        let mut m = std::collections::HashMap::new();
+        m.insert(r.id, "10.0.0.9".parse().unwrap());
+        s.set_resolved(m);
+        assert_eq!(s.resolved_ip(r.id), Some("10.0.0.9".parse().unwrap()));
+        // 删除规则同时清缓存
+        s.remove_forward(r.id);
+        assert_eq!(s.resolved_ip(r.id), None);
     }
 
     #[test]
