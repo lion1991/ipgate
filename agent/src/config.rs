@@ -19,6 +19,13 @@ pub struct AgentConfig {
     pub public_udp: Vec<PortRange>,
     /// 数据目录（存储、密钥、证书）。
     pub data_dir: PathBuf,
+    /// 管理 API 访问密钥门：要求每个请求带 `X-Ipgate-Key`，否则一律 404（端口对外「变暗」）。
+    ///
+    /// **默认 false**：升级既有部署时不会突然把现有客户端挡在门外（盲改 = 自找麻烦）。
+    /// 全新安装由 install.sh 写成 true 并打印 join 串。开启前请确认客户端已带上访问密钥。
+    pub require_access_key: bool,
+    /// 每源 IP 每分钟最大请求数（0 = 不限）。挡探测/刷量/暴力。默认 120，对正常轮询绰绰有余。
+    pub rate_limit_per_min: u32,
 }
 
 impl Default for AgentConfig {
@@ -29,6 +36,9 @@ impl Default for AgentConfig {
             public_tcp: Vec::new(),
             public_udp: Vec::new(),
             data_dir: PathBuf::from("/var/lib/ipgate"),
+            // 默认关：保升级不锁现有客户端。全新安装由 install.sh 置 true。
+            require_access_key: false,
+            rate_limit_per_min: 120,
         }
     }
 }

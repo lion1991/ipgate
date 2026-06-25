@@ -61,30 +61,44 @@ struct Harness {
     backend: Arc<MockNft>,
     fingerprint: SpkiFingerprint,
     data_dir: std::path::PathBuf,
+    access_key: String,
 }
 
 fn harness() -> Harness {
+    harness_cfg(false)
+}
+
+fn harness_cfg(require_access_key: bool) -> Harness {
     let data_dir = std::env::temp_dir().join(format!("ipgate-e2e-{}", to_hex(&random_bytes::<8>())));
     let cfg = AgentConfig {
         data_dir: data_dir.clone(),
+        require_access_key,
         ..AgentConfig::default()
     };
     let identity = tls::load_or_generate(&data_dir).unwrap();
     let backend = Arc::new(MockNft::default());
     let store = Arc::new(Mutex::new(Store::load(&cfg.store_path()).unwrap()));
     let auth = Arc::new(AuthState::load_or_generate(&data_dir).unwrap());
+    let access_key = auth.access_key.clone();
+    let rate = Arc::new(crate::api::RateLimiter::new(
+        cfg.rate_limit_per_min,
+        std::time::Duration::from_secs(60),
+    ));
     let state = AppState {
         cfg: Arc::new(cfg),
         store,
         backend: backend.clone(),
         auth,
         fingerprint: identity.fingerprint.clone(),
+        require_access_key,
+        rate,
     };
     Harness {
         app: router(state),
         backend,
         fingerprint: identity.fingerprint,
         data_dir,
+        access_key,
     }
 }
 
@@ -309,5 +323,43 @@ async fn forged_token_is_rejected() {
     let forged = crate::auth::token::issue(DeviceId::new(), Utc::now() + chrono::Duration::hours(1), &[1u8; 32]);
     let (st, _) = call(&h.app, "GET", "/v1/allowlist", Some(forged.as_str()), None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+/// 访问密钥门开启时：无/错密钥 → 连 `/healthz`、`/v1/pair` 都是裸 404（端口「变暗」）；
+/// 正确密钥 → 正常放行。门挡在路由/JSON 解析之前。
+#[tokio::test]
+async fn access_gate_darkens_port_without_key() {
+    let h = harness_cfg(true);
+
+    let get_with = |key: Option<&str>| {
+        let mut b = Request::builder().method("GET").uri("/healthz");
+        if let Some(k) = key {
+            b = b.header("x-ipgate-key", k);
+        }
+        b.body(Body::empty()).unwrap()
+    };
+
+    // 无密钥 → 404（不是 200 "ok"，扫描器看不到 ipgate）
+    let resp = h.app.clone().oneshot(get_with(None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // 错密钥 → 404
+    let resp = h.app.clone().oneshot(get_with(Some("deadbeef"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // 连 /v1/pair 也变暗：无密钥时哪怕发垃圾 body 也只得 404（根本到不了 JSON 解析）
+    let (st, _) = call(&h.app, "POST", "/v1/pair", None, Some(b"garbage".to_vec())).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // 正确密钥 → 放行
+    let resp = h
+        .app
+        .clone()
+        .oneshot(get_with(Some(&h.access_key)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }

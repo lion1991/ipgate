@@ -224,7 +224,9 @@ else
   "mgmt_port": 19186,
   "public_tcp": [],
   "public_udp": [],
-  "data_dir": "/var/lib/ipgate"
+  "data_dir": "/var/lib/ipgate",
+  "require_access_key": true,
+  "rate_limit_per_min": 120
 }
 JSON
   chmod 0644 "$CONF_DIR/config.json"
@@ -310,8 +312,11 @@ dev_count="$("$PREFIX/ipgate-agent" --config "$CONF_DIR/config.json" status 2>/d
 if [ "$dev_count" -gt 0 ] 2>/dev/null; then
   log "升级完成（已有 $dev_count 个已配对设备，无需重新配对）。"
 else
-  log "生成首个配对码（供客户端入网）:"
+  log "生成首个配对口令（供客户端入网；含访问密钥，端口已对外「变暗」）:"
   "$PREFIX/ipgate-agent" --config "$CONF_DIR/config.json" pair || true
+  echo
+  log "把上面整串「访问密钥.配对码」粘到客户端「配对码」栏，并逐位核对指纹。"
+  log "（随时可重印访问密钥: ipgate-agent access-key；重置: ipgate-agent access-key --reset 后 restart）"
 fi
 echo
 log "完成。校验 ruleset: nft list table inet ipgate"

@@ -66,6 +66,12 @@ enum Cmd {
         /// 目标 IP 或 CIDR。
         target: String,
     },
+    /// 打印（或重置）管理端口访问密钥。
+    AccessKey {
+        /// 重置为新密钥（旧客户端需用新密钥重配对；运行中的服务需 restart 才生效）。
+        #[arg(long)]
+        reset: bool,
+    },
     /// 打印将要应用的 nftables ruleset（不改内核，便于审计）。
     PrintRuleset,
     /// 显示存储条目与内核 set 当前状态。
@@ -91,6 +97,22 @@ fn main() -> Result<()> {
             ttl_secs,
         } => allow_cli(&cfg, &target, &note, ttl_secs)?,
         Cmd::Revoke { target } => revoke_cli(&cfg, &target)?,
+        Cmd::AccessKey { reset } => {
+            let key = if reset {
+                auth::access::reset(&cfg.data_dir)?
+            } else {
+                auth::access::load_or_generate(&cfg.data_dir)?
+            };
+            println!("{key}");
+            if reset {
+                eprintln!(
+                    "已重置访问密钥。运行中的服务需 `systemctl restart ipgate-agent` 才生效；\
+                     现有客户端需用新密钥重配对/更新。"
+                );
+            } else if !cfg.require_access_key {
+                eprintln!("注意：require_access_key=false，当前未强制此密钥（端口仍匿名可达）。");
+            }
+        }
         Cmd::PrintRuleset => {
             let store = Store::load(&cfg.store_path())?;
             print!(
@@ -110,13 +132,21 @@ fn main() -> Result<()> {
 fn pair(cfg: &AgentConfig) -> Result<()> {
     let identity = tls::load_or_generate(&cfg.data_dir)?;
     let code = auth::pairing::create(&cfg.data_dir, PAIRING_CODE_TTL_SECS, Utc::now())?;
-    println!(
-        "配对码（{} 分钟内有效、单次）：{}",
-        PAIRING_CODE_TTL_SECS / 60,
-        code.as_str()
-    );
-    println!("服务端指纹：{}", identity.fingerprint);
-    println!("在客户端输入主机地址 + 上面的配对码，并核对指纹。");
+    let ttl_min = PAIRING_CODE_TTL_SECS / 60;
+    println!("服务端指纹（逐位核对）：{}", identity.fingerprint);
+    if cfg.require_access_key {
+        // join 串 = 访问密钥.配对码；客户端粘一次、自动拆分，之后每次请求都带访问密钥。
+        let access = auth::access::load_or_generate(&cfg.data_dir)?;
+        println!(
+            "配对口令（{ttl_min} 分钟内有效、单次，粘贴到客户端「配对码」栏）：\n  {}.{}",
+            access,
+            code.as_str()
+        );
+    } else {
+        println!("配对码（{ttl_min} 分钟内有效、单次）：{}", code.as_str());
+        println!("（提示：管理端口访问密钥门未开 require_access_key=false；建议开启以让端口对外「变暗」）");
+    }
+    println!("在客户端输入主机地址 + 上面的口令，并核对指纹。");
     Ok(())
 }
 
@@ -184,6 +214,12 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
     info!("ruleset 已应用");
 
     let auth = Arc::new(AuthState::load_or_generate(&cfg.data_dir)?);
+    if !cfg.require_access_key {
+        warn!(
+            "管理端口未启用访问密钥门（require_access_key=false）：配对/挑战等接口对任意 IP 可达。\
+             建议 config.json 置 true，并让客户端带上 `ipgate-agent access-key` 的密钥。"
+        );
+    }
     let cfg = Arc::new(cfg);
 
     // 后台对账线程（阻塞式，独立于 async server）。
@@ -199,6 +235,11 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
         backend,
         auth,
         fingerprint: identity.fingerprint.clone(),
+        require_access_key: cfg.require_access_key,
+        rate: Arc::new(api::RateLimiter::new(
+            cfg.rate_limit_per_min,
+            Duration::from_secs(60),
+        )),
     };
     info!(%addr, "启动 TLS API 服务");
 
