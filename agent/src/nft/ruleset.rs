@@ -7,12 +7,20 @@ use ipgate_proto::{
 };
 use ipnet::IpNet;
 
-/// 必要的 ICMPv6 类型：缺了 IPv6 直接瘫（邻居发现/RA/PMTUD）。
-const ICMPV6_TYPES: &str = "nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, \
-nd-router-advert, echo-request, echo-reply, destination-unreachable, packet-too-big, \
+/// 基础设施类 ICMPv6：缺了 IPv6 直接瘫（邻居发现/RA/PMTUD），对**所有来源**无条件放行。
+///
+/// 刻意**不含 echo-request/echo-reply（ping）**：ping 被视作访问/探测面，只放给名单内
+/// 源 IP（见 chain 末尾 `ip6 saddr @allow6 accept`），未放行的 IP 一律 ping 不通。
+/// 本机主动外发 ping 的回包走 `ct state established,related`，无需在此放行 echo-reply。
+const ICMPV6_INFRA_TYPES: &str = "nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, \
+nd-router-advert, destination-unreachable, packet-too-big, \
 time-exceeded, parameter-problem";
-const ICMP_TYPES: &str =
-    "echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem";
+/// 基础设施类 ICMPv4：PMTUD/错误类，对**所有来源**无条件放行。
+///
+/// 同样**不含 echo（ping）**——ping 只放给名单内源 IP（`ip saddr @allow4 accept`）。
+/// 保留这些错误类是为防 PMTUD 黑洞（路径 MTU 探测失败会让连接神秘卡死）。
+const ICMP_INFRA_TYPES: &str =
+    "destination-unreachable, time-exceeded, parameter-problem";
 
 /// 返回 `inet ipgate` 这个表的限定名（`inet ipgate`）。
 fn table() -> String {
@@ -111,11 +119,13 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
     s.push_str("        ct state established,related accept\n");
     s.push_str("        ct state invalid drop\n");
     s.push_str("        iif lo accept\n");
+    // 仅基础设施类 ICMP 对所有来源放行；echo（ping）不在内，故未放行的 IP ping 不通，
+    // 名单内源 IP 的 ping 由下方 saddr 规则放行（名单源获全量访问）。
     s.push_str(&format!(
-        "        ip6 nexthdr icmpv6 icmpv6 type {{ {ICMPV6_TYPES} }} accept\n"
+        "        ip6 nexthdr icmpv6 icmpv6 type {{ {ICMPV6_INFRA_TYPES} }} accept\n"
     ));
     s.push_str(&format!(
-        "        ip protocol icmp icmp type {{ {ICMP_TYPES} }} accept\n"
+        "        ip protocol icmp icmp type {{ {ICMP_INFRA_TYPES} }} accept\n"
     ));
     // 管理端口：无条件放行（ADR 0003 不变量），字面规则、不可被 API 移除。
     s.push_str(&format!("        tcp dport {} accept\n", cfg.mgmt_port));
@@ -181,6 +191,12 @@ mod tests {
         // 必要 ICMPv6（防 IPv6 瘫痪）
         assert!(s.contains("nd-neighbor-solicit"));
         assert!(s.contains("nd-router-advert"));
+        // PMTUD 错误类保留（防黑洞）
+        assert!(s.contains("packet-too-big"));
+        assert!(s.contains("destination-unreachable"));
+        // ping（echo）绝不无条件放行 —— 未放行的 IP ping 不通（仅名单源 IP 经 saddr 规则可 ping）
+        assert!(!s.contains("echo-request"));
+        assert!(!s.contains("echo-reply"));
         // 名单引用
         assert!(s.contains("ip saddr @allow4 accept"));
         assert!(s.contains("ip6 saddr @allow6 accept"));
