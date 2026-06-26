@@ -8,6 +8,7 @@ pub use limit::RateLimiter;
 
 use crate::auth::AuthState;
 use crate::config::AgentConfig;
+use crate::dnat::DnatAdapter;
 use crate::nft::{NatBackend, NftBackend};
 use crate::store::Store;
 use crate::tls::ServerIdentity;
@@ -34,6 +35,8 @@ pub struct AppState {
     pub backend: Arc<dyn NftBackend + Send + Sync>,
     /// 端口转发落地后端（`ip ipgate_nat` 表）。
     pub nat: Arc<dyn NatBackend + Send + Sync>,
+    /// dnat 适配器（ADR 0006 排空模型：统一列表 + 删除/迁移 dnat 规则）。
+    pub dnat: Arc<DnatAdapter>,
     pub auth: Arc<AuthState>,
     /// 本服务端 SPKI 指纹（登录挑战绑定信道用）。
     pub fingerprint: SpkiFingerprint,
@@ -65,6 +68,15 @@ pub fn router(state: AppState) -> Router {
             get(handlers::list_forwards).post(handlers::add_forward),
         )
         .route("/v1/forwards/{id}", delete(handlers::remove_forward))
+        // dnat 适配（ADR 0006）：删除 / 迁移 dnat 规则（key 为 base64url 的 PrefixKey）
+        .route(
+            "/v1/forwards/dnat/{key}",
+            delete(handlers::remove_dnat_forward),
+        )
+        .route(
+            "/v1/forwards/dnat/{key}/migrate",
+            post(handlers::migrate_dnat_forward),
+        )
         .route("/v1/interfaces", get(handlers::list_interfaces))
         .route("/v1/devices", get(handlers::list_devices))
         .route("/v1/devices/{id}", delete(handlers::revoke_device))

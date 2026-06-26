@@ -4,8 +4,12 @@
 //! 转发的 DNAT/SNAT 逻辑就算渲染出错、被 `delete table` 重建，也碰不到
 //! `inet ipgate` 里的管理端口放行不变量（ADR 0002/0003）。
 //!
-//! 优先级用**数字**（-100/100/0）而非 `dstnat`/`srcnat`/`filter` 命名：命名优先级要
-//! nft 0.9+，数字在 el7 的 0.8 也认（与 `ruleset.rs` 的兼容口径一致）。
+//! 优先级用**数字**而非 `dstnat`/`srcnat`/`filter` 命名：命名优先级要 nft 0.9+，
+//! 数字在 el7 的 0.8 也认（与 `ruleset.rs` 的兼容口径一致）。
+//!
+//! prerouting `-90`、postrouting `110`（**刻意错开** dnat 工具的标准 `-100`/`100`，
+//! ADR 0006 排空模型）：两表过渡期并存时，dnat 的链优先级更靠前 → dnat 在就 dnat 赢，
+//! 共存行为确定（非未定义）；逐条迁移时「先建 native(-90) 再删 dnat(-100)」零瞬断。
 
 use ipgate_proto::{ForwardProto, PortRange, NFT_NAT_TABLE};
 use std::net::Ipv4Addr;
@@ -47,7 +51,7 @@ pub fn render_nat_apply(forwards: &[ResolvedForward]) -> String {
 
     // prerouting：DNAT —— 本机入向包改写目的地址/端口到远端。
     s.push_str("    chain prerouting {\n");
-    s.push_str("        type nat hook prerouting priority -100; policy accept;\n");
+    s.push_str("        type nat hook prerouting priority -90; policy accept;\n");
     for f in forwards {
         for proto in f.proto.l4_protos() {
             s.push_str(&format!(
@@ -63,7 +67,7 @@ pub fn render_nat_apply(forwards: &[ResolvedForward]) -> String {
 
     // postrouting：SNAT —— 回程出向包改写源地址为 source_ip，保证回包能找回本机。
     s.push_str("    chain postrouting {\n");
-    s.push_str("        type nat hook postrouting priority 100; policy accept;\n");
+    s.push_str("        type nat hook postrouting priority 110; policy accept;\n");
     for f in forwards {
         for proto in f.proto.l4_protos() {
             s.push_str(&format!(
@@ -129,8 +133,9 @@ mod tests {
             PortRange::single(8443),
         )]);
         assert!(s.contains("table ip ipgate_nat {"));
-        assert!(s.contains("type nat hook prerouting priority -100"));
-        assert!(s.contains("type nat hook postrouting priority 100"));
+        // 优先级刻意错开 dnat 的 -100/100（ADR 0006 排空模型）。
+        assert!(s.contains("type nat hook prerouting priority -90"));
+        assert!(s.contains("type nat hook postrouting priority 110"));
         assert!(s.contains("type filter hook forward priority 0"));
         assert!(s.contains("iifname \"eth0\" tcp dport 443 dnat to 10.0.0.9:8443"));
         assert!(s.contains("ip daddr 10.0.0.9 tcp dport 8443 snat to 192.168.1.5"));

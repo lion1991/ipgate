@@ -132,6 +132,63 @@ pub struct ForwardList {
     pub revision: u64,
 }
 
+/// 一条转发的来源（统一列表区分 native 与 dnat 适配，ADR 0006）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardOrigin {
+    /// ipgate 自己的 native 转发（`ip ipgate_nat` 表，全增删改）。
+    Ipgate,
+    /// 外部 dnat 工具创建（`ip dnat_utils` 表）；排空模型下只读+删+迁移。
+    Dnat,
+}
+
+/// 客户端对一条转发能做什么（排空模型：dnat 规则不可改、可删、可迁移）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardCaps {
+    pub can_edit: bool,
+    pub can_delete: bool,
+    pub can_migrate: bool,
+}
+
+/// 统一列表里的一条转发（合并 native + dnat 两来源，ADR 0006）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnifiedForwardView {
+    pub origin: ForwardOrigin,
+    pub proto: ForwardProto,
+    /// native 可为 `None`（默认路由网卡）；dnat 总为具体网卡名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+    pub listen: PortRange,
+    pub dest_host: String,
+    pub dest_port: PortRange,
+    pub source: ForwardSource,
+    #[serde(default)]
+    pub note: String,
+    /// 当前解析到的目标 IPv4。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_ip: Option<Ipv4Addr>,
+    /// 是否已在内核生效。
+    pub active: bool,
+    pub caps: ForwardCaps,
+    /// 与另一来源存在同网卡同端口重叠（过渡期碰撞提示）。
+    #[serde(default)]
+    pub conflict: bool,
+    /// native 规则 id（`origin=ipgate` 时 `Some`；删除/编辑目标）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<ForwardId>,
+    /// dnat 规则键（`origin=dnat` 时 `Some`；URL 安全，删除/迁移用）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dnat_key: Option<String>,
+}
+
+/// 统一转发列表快照。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnifiedForwardList {
+    pub forwards: Vec<UnifiedForwardView>,
+    /// native 修订号（dnat 侧无版本，仅 native 计）。
+    pub revision: u64,
+}
+
 /// 主机网卡信息（客户端做下拉选择 + 源 IP 提示）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceInfo {

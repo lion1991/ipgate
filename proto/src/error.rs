@@ -42,6 +42,8 @@ pub enum ErrorCode {
     BadRequest,
     /// 操作会挡住管理端口，被拒（ADR 0002/0003 不变量）。
     WouldLockOut,
+    /// 与现有规则冲突（如转发监听端口已被 dnat 规则占用，ADR 0006）。
+    Conflict,
     /// 限速 / 锁定中。
     RateLimited,
     /// 条目 / 设备不存在。
