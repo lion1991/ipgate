@@ -6,6 +6,7 @@
 mod api;
 mod auth;
 mod config;
+mod dnat;
 mod forward;
 mod netinfo;
 mod nft;
@@ -105,6 +106,26 @@ enum Cmd {
         /// 规则 id（uuid）。
         id: String,
     },
+    /// 列出本机 dnat 工具创建的转发（ADR 0006 排空模型）。
+    DnatForwards,
+    /// 迁移一条 dnat 规则到 native（先建 native(-90) 再删 dnat(-100)，零瞬断）。
+    DnatMigrate {
+        /// 本地监听端口或区间，如 443 或 8000-8010。
+        #[arg(long)]
+        listen: String,
+        /// 入口网卡（dnat 规则总带具体网卡名）。
+        #[arg(long)]
+        iface: String,
+    },
+    /// 删除一条 dnat 规则（改 dnat conf + 触发 `dnat apply`）。
+    DnatRm {
+        /// 本地监听端口或区间。
+        #[arg(long)]
+        listen: String,
+        /// 入口网卡。
+        #[arg(long)]
+        iface: String,
+    },
     /// 打印将要应用的 nftables ruleset（不改内核，便于审计）。
     PrintRuleset,
     /// 显示存储条目与内核 set 当前状态。
@@ -156,6 +177,9 @@ fn main() -> Result<()> {
             note,
         } => forward_add_cli(&cfg, &listen, &dest, &proto, iface, &source, &note)?,
         Cmd::ForwardRm { id } => forward_rm_cli(&cfg, &id)?,
+        Cmd::DnatForwards => dnat_forwards_cli(&cfg)?,
+        Cmd::DnatMigrate { listen, iface } => dnat_migrate_cli(&cfg, &listen, &iface)?,
+        Cmd::DnatRm { listen, iface } => dnat_rm_cli(&cfg, &listen, &iface)?,
         Cmd::PrintRuleset => {
             let store = Store::load(&cfg.store_path())?;
             print!(
@@ -351,6 +375,20 @@ fn forward_add_cli(
         anyhow::bail!("目标主机为空");
     }
 
+    // 碰撞检测：与 HTTP add_forward 对齐（评审：CLI 此前漏了这道闸，破坏「同端口不双权威」不变量）。
+    let adapter = dnat::DnatAdapter::new(cfg.dnat.clone());
+    if adapter.present() {
+        if let Some(eff) = req.iface.clone().or_else(netinfo::default_route_iface) {
+            if adapter
+                .rules()
+                .into_iter()
+                .any(|d| d.iface == eff && req.listen.overlaps(&d.listen))
+            {
+                anyhow::bail!("监听端口已被本机 dnat 规则占用，请先 `dnat-migrate` 或换端口");
+            }
+        }
+    }
+
     let store = Arc::new(Mutex::new(Store::load(&cfg.store_path())?));
     let rule = {
         let mut s = store.lock().unwrap();
@@ -397,6 +435,112 @@ fn forward_rm_cli(cfg: &AgentConfig, id: &str) -> Result<()> {
     let nat: Arc<dyn NatBackend + Send + Sync> = Arc::new(NftCli::new());
     let _ = forward::apply_now(&store, &nat);
     println!("已删除转发 {id}");
+    Ok(())
+}
+
+// ---- dnat 适配 CLI（ADR 0006 排空模型；离线操作 conf + 触发 dnat apply）----
+
+fn dnat_forwards_cli(cfg: &AgentConfig) -> Result<()> {
+    let adapter = dnat::DnatAdapter::new(cfg.dnat.clone());
+    let rules = adapter.rules();
+    println!(
+        "dnat 转发规则：{}（{}）",
+        rules.len(),
+        if adapter.present() {
+            "适配已启用"
+        } else {
+            "适配未启用，仅离线读 conf"
+        }
+    );
+    for r in &rules {
+        let src = match r.source {
+            ForwardSource::Auto => "auto".to_string(),
+            ForwardSource::Ip(ip) => ip.to_string(),
+        };
+        println!(
+            "  [tcp+udp] {} :{} → {}:{}  源={}  键={}",
+            r.iface,
+            fmt_ports(&r.listen),
+            r.remote_host,
+            fmt_ports(&r.dest_port),
+            src,
+            dnat::encode_key(&r.prefix_key()),
+        );
+    }
+    Ok(())
+}
+
+/// 离线找一条 dnat 规则（按监听端口 + 网卡）。
+fn find_dnat_rule(adapter: &dnat::DnatAdapter, listen: &str, iface: &str) -> Result<dnat::DnatRule> {
+    let listen = parse_port_range(listen)?;
+    adapter
+        .rules()
+        .into_iter()
+        .find(|r| r.listen == listen && r.iface == iface)
+        .with_context(|| format!("无匹配的 dnat 规则：{iface} :{}", fmt_ports(&listen)))
+}
+
+fn dnat_rm_cli(cfg: &AgentConfig, listen: &str, iface: &str) -> Result<()> {
+    let adapter = dnat::DnatAdapter::new(cfg.dnat.clone());
+    let rule = find_dnat_rule(&adapter, listen, iface)?;
+    if adapter.remove_prefix(&rule.prefix_key())? {
+        println!("已删除 dnat 规则 {} :{}", iface, fmt_ports(&rule.listen));
+    } else {
+        println!("无此 dnat 规则");
+    }
+    Ok(())
+}
+
+fn dnat_migrate_cli(cfg: &AgentConfig, listen: &str, iface: &str) -> Result<()> {
+    let adapter = dnat::DnatAdapter::new(cfg.dnat.clone());
+    let rule = find_dnat_rule(&adapter, listen, iface)?;
+    let req = dnat::dnat_rule_to_add_request(&rule);
+
+    // native 表达不了的映射不能迁移；目标 (网卡,端口) 已有 native 规则则拒（避免静默覆盖）。评审。
+    ipgate_proto::validate_ports(&req.listen, &req.dest_port)
+        .map_err(|e| anyhow::anyhow!("该 dnat 规则的端口映射 native 不支持，无法迁移：{e}"))?;
+    let store = Arc::new(Mutex::new(Store::load(&cfg.store_path())?));
+    {
+        let s = store.lock().unwrap();
+        if s.forwards().iter().any(|f| {
+            f.iface.clone().or_else(netinfo::default_route_iface).as_deref() == Some(rule.iface.as_str())
+                && f.listen.overlaps(&rule.listen)
+        }) {
+            anyhow::bail!("目标 (网卡,端口) 已有 native 转发，迁移会覆盖它；请先处理后再迁移");
+        }
+    }
+
+    // 先建 native（-90，dnat -100 仍赢→零抖动）→ 落地 → 核实生效 → 再删 dnat（零瞬断）。
+    let new_rule = {
+        let mut s = store.lock().unwrap();
+        let r = s.add_forward(req, DeviceId(Uuid::nil()), Utc::now());
+        s.save()?;
+        r
+    };
+    let nat: Arc<dyn NatBackend + Send + Sync> = Arc::new(NftCli::new());
+    forward::apply_now(&store, &nat).context("native 落地失败（已写存储，未撤 dnat）")?;
+    // native 未解析生效则回滚僵尸规则、保留 dnat（评审：避免在 native 没生效时撤 dnat 致转发全黑）。
+    if store.lock().unwrap().resolved_ip(new_rule.id).is_none() {
+        {
+            let mut s = store.lock().unwrap();
+            s.remove_forward(new_rule.id);
+            let _ = s.save();
+        }
+        let _ = forward::apply_now(&store, &nat);
+        anyhow::bail!("native 规则未能解析/生效（如域名暂时解析失败），已保留原 dnat，请稍后重试");
+    }
+    adapter
+        .remove_prefix(&rule.prefix_key())
+        .context("native 已生效，但撤原 dnat 规则失败（dnat 仍在服务，可重试或手动 dnat-rm）")?;
+
+    println!(
+        "已迁移 dnat → native：{} :{} → {}:{}  (native id={})",
+        iface,
+        fmt_ports(&new_rule.listen),
+        new_rule.dest_host,
+        fmt_ports(&new_rule.dest_port),
+        new_rule.id,
+    );
     Ok(())
 }
 
@@ -457,11 +601,13 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
     }
 
     let addr = cfg.bind;
+    let dnat = Arc::new(dnat::DnatAdapter::new(cfg.dnat.clone()));
     let state = api::AppState {
         cfg: cfg.clone(),
         store,
         backend,
         nat,
+        dnat,
         auth,
         fingerprint: identity.fingerprint.clone(),
         require_access_key: cfg.require_access_key,

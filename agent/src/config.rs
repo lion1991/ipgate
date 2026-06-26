@@ -26,6 +26,8 @@ pub struct AgentConfig {
     pub require_access_key: bool,
     /// 每源 IP 每分钟最大请求数（0 = 不限）。挡探测/刷量/暴力。默认 120，对正常轮询绰绰有余。
     pub rate_limit_per_min: u32,
+    /// dnat 适配（ADR 0006，排空模型）：统一查看/删除本机 dnat 规则；新增走 native。默认关。
+    pub dnat: crate::dnat::DnatAdapterConfig,
 }
 
 impl Default for AgentConfig {
@@ -39,6 +41,7 @@ impl Default for AgentConfig {
             // 默认关：保升级不锁现有客户端。全新安装由 install.sh 置 true。
             require_access_key: false,
             rate_limit_per_min: 120,
+            dnat: crate::dnat::DnatAdapterConfig::default(),
         }
     }
 }

@@ -12,8 +12,9 @@ use chrono::{Duration, Utc};
 use ipgate_proto::{
     validate_ports, AddForwardRequest, AllowRequest, Allowlist, AuthChallengeRequest,
     AuthChallengeResponse, AuthVerifyRequest, AuthVerifyResponse, Device, DeviceId, Diff, Entry,
-    ErrorCode, ForwardId, ForwardList, ForwardView, InterfaceInfo, PairRequest, PairResponse,
-    RevokeRequest, SessionToken, WhoamiResponse, SESSION_TOKEN_TTL_SECS,
+    ErrorCode, ForwardCaps, ForwardId, ForwardOrigin, ForwardRule, ForwardView, InterfaceInfo,
+    PairRequest, PairResponse, RevokeRequest, SessionToken, UnifiedForwardList, UnifiedForwardView,
+    WhoamiResponse, SESSION_TOKEN_TTL_SECS,
 };
 use std::net::SocketAddr;
 
@@ -219,21 +220,80 @@ fn forward_view(store: &crate::store::Store, rule: ipgate_proto::ForwardRule) ->
     }
 }
 
+/// 规则的有效网卡：显式 `iface`，否则默认路由网卡（与 native 落地口径一致）。
+fn effective_iface(iface: &Option<String>) -> Option<String> {
+    iface.clone().or_else(crate::netinfo::default_route_iface)
+}
+
+/// native 规则 → 统一视图（origin=ipgate，全增删改）。
+fn native_unified(store: &crate::store::Store, rule: ForwardRule) -> UnifiedForwardView {
+    let resolved_ip = store.resolved_ip(rule.id);
+    UnifiedForwardView {
+        origin: ForwardOrigin::Ipgate,
+        proto: rule.proto,
+        listen: rule.listen,
+        dest_port: rule.dest_port,
+        source: rule.source,
+        resolved_ip,
+        active: resolved_ip.is_some(),
+        caps: ForwardCaps { can_edit: true, can_delete: true, can_migrate: false },
+        conflict: false,
+        id: Some(rule.id),
+        dnat_key: None,
+        iface: rule.iface,
+        dest_host: rule.dest_host,
+        note: rule.note,
+    }
+}
+
+/// 统一转发列表：native（`ip ipgate_nat`）+ dnat（`dnat_utils`，启用时），跨来源标冲突。
 pub async fn list_forwards(
     State(st): State<AppState>,
     _auth: AuthDevice,
-) -> ApiResult<Json<ForwardList>> {
-    let store = st.store.lock().unwrap();
-    let forwards = store
-        .forwards()
-        .iter()
-        .cloned()
-        .map(|r| forward_view(&store, r))
-        .collect();
-    Ok(Json(ForwardList {
-        forwards,
-        revision: store.forward_revision(),
-    }))
+) -> ApiResult<Json<UnifiedForwardList>> {
+    let (mut forwards, revision) = {
+        let store = st.store.lock().unwrap();
+        let native: Vec<UnifiedForwardView> = store
+            .forwards()
+            .iter()
+            .cloned()
+            .map(|r| native_unified(&store, r))
+            .collect();
+        (native, store.forward_revision())
+    };
+
+    let mut dnat_views: Vec<UnifiedForwardView> =
+        if st.dnat.present() { st.dnat.list() } else { Vec::new() };
+
+    // 跨来源回填 conflict：同（有效网卡, 端口区间重叠）即过渡期碰撞。
+    if !dnat_views.is_empty() {
+        let default_iface = crate::netinfo::default_route_iface();
+        let eff = |v: &UnifiedForwardView| v.iface.clone().or_else(|| default_iface.clone());
+        for n in forwards.iter_mut() {
+            let (ni, nl) = (eff(n), n.listen);
+            // ni.is_some() 守卫：网卡无法确定时不臆断为冲突（评审 None 比较坑）。
+            if ni.is_some()
+                && dnat_views
+                    .iter()
+                    .any(|d| eff(d) == ni && nl.overlaps(&d.listen))
+            {
+                n.conflict = true;
+            }
+        }
+        for d in dnat_views.iter_mut() {
+            let (di, dl) = (eff(d), d.listen);
+            if di.is_some()
+                && forwards
+                    .iter()
+                    .any(|n| eff(n) == di && dl.overlaps(&n.listen))
+            {
+                d.conflict = true;
+            }
+        }
+    }
+
+    forwards.append(&mut dnat_views);
+    Ok(Json(UnifiedForwardList { forwards, revision }))
 }
 
 pub async fn add_forward(
@@ -245,6 +305,23 @@ pub async fn add_forward(
         .map_err(|e| AppError::new(ErrorCode::BadRequest, e))?;
     if req.dest_host.trim().is_empty() {
         return Err(AppError::new(ErrorCode::BadRequest, "目标主机为空"));
+    }
+
+    // 碰撞检测（ADR 0006 排空模型）：监听端口被本机 dnat 规则占用则拒，引导先迁移。
+    // eff_iface 为 None（无显式 iface 且默认路由不可知）时跳过——此种规则落地期
+    // resolve 本就会失败被跳过，不会进内核，无真实碰撞（评审 None 比较坑）。
+    if st.dnat.present() {
+        if let Some(eff_iface) = effective_iface(&req.iface) {
+            let clash = st.dnat.rules().into_iter().any(|d| {
+                d.iface == eff_iface && req.listen.overlaps(&d.listen)
+            });
+            if clash {
+                return Err(AppError::new(
+                    ErrorCode::Conflict,
+                    "监听端口已被本机 dnat 规则占用，请先迁移该 dnat 规则或改用其它端口",
+                ));
+            }
+        }
     }
 
     let now = Utc::now();
@@ -285,6 +362,118 @@ pub async fn remove_forward(
     crate::forward::apply_now(&st.store, &st.nat)
         .map_err(|e| AppError::new(ErrorCode::NftFailure, e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- dnat 适配（ADR 0006 排空模型）：删除 / 迁移 dnat 规则 ----
+
+/// 解码 dnat key（base64url 的 PrefixKey），并确认本机启用了 dnat 适配。
+fn dnat_prefix_from_key(st: &AppState, key: &str) -> Result<String, AppError> {
+    if !st.dnat.present() {
+        return Err(AppError::new(ErrorCode::NotFound, "本机未启用 dnat 适配"));
+    }
+    crate::dnat::decode_key(key).ok_or_else(|| AppError::new(ErrorCode::BadRequest, "非法 dnat 键"))
+}
+
+/// 删除一条 dnat 规则（改 dnat conf + 触发 `dnat apply`，不动 native）。
+pub async fn remove_dnat_forward(
+    State(st): State<AppState>,
+    _auth: AuthDevice,
+    Path(key): Path<String>,
+) -> ApiResult<StatusCode> {
+    let prefix = dnat_prefix_from_key(&st, &key)?;
+    let removed = st
+        .dnat
+        .remove_prefix(&prefix)
+        .map_err(|e| AppError::new(ErrorCode::NftFailure, e.to_string()))?;
+    if !removed {
+        return Err(AppError::new(ErrorCode::NotFound, "dnat 规则不存在"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 迁移一条 dnat 规则到 native（`ip ipgate_nat`）。
+///
+/// 顺序（ADR 0006 零瞬断）：先建 native(`-90`)（此刻 dnat(`-100`) 仍先匹配→零抖动）→
+/// native 生效后再撤 dnat（包落到 native，无瞬断）。撤 dnat 失败不回滚：native 已接管。
+pub async fn migrate_dnat_forward(
+    State(st): State<AppState>,
+    auth: AuthDevice,
+    Path(key): Path<String>,
+) -> ApiResult<Json<ForwardView>> {
+    let prefix = dnat_prefix_from_key(&st, &key)?;
+    let rule = st
+        .dnat
+        .find_rule_by_prefix(&prefix)
+        .ok_or_else(|| AppError::new(ErrorCode::NotFound, "dnat 规则不存在"))?;
+    let req = crate::dnat::dnat_rule_to_add_request(&rule);
+
+    // dnat 允许、但 native 表达不了的映射（如单监听→目标区间）不能迁移（评审）。
+    validate_ports(&req.listen, &req.dest_port).map_err(|e| {
+        AppError::new(
+            ErrorCode::BadRequest,
+            format!("该 dnat 规则的端口映射 native 不支持，无法迁移：{e}"),
+        )
+    })?;
+
+    // 目标 (网卡,端口) 已有 native 转发则拒——否则 store.add_forward 会按 (iface,listen)
+    // 静默覆盖掉那条无关 native 规则（评审）。dnat 规则的 iface 必为具体名。
+    {
+        let store = st.store.lock().unwrap();
+        let clobbers = store.forwards().iter().any(|f| {
+            effective_iface(&f.iface).as_deref() == Some(rule.iface.as_str())
+                && f.listen.overlaps(&rule.listen)
+        });
+        if clobbers {
+            return Err(AppError::new(
+                ErrorCode::Conflict,
+                "目标 (网卡,端口) 已有 native 转发，迁移会覆盖它；请先处理后再迁移",
+            ));
+        }
+    }
+
+    // 顺序（ADR 0006 零瞬断）：先建 native(-90)（dnat(-100) 仍先匹配→零抖动）。
+    let now = Utc::now();
+    let new_rule = {
+        let mut store = st.store.lock().unwrap();
+        let r = store.add_forward(req, auth.0, now);
+        store.save().map_err(internal)?;
+        r
+    };
+    let id = new_rule.id;
+    crate::forward::apply_now(&st.store, &st.nat)
+        .map_err(|e| AppError::new(ErrorCode::NftFailure, e.to_string()))?;
+
+    // 确认 native 真生效（解析成功＝已进内核）。apply_now 对解析失败的条目只是跳过、仍返回
+    // Ok，所以必须显式核对，否则会在 native 没生效时就撤 dnat → 转发全黑（违反零瞬断，评审）。
+    let live = st.store.lock().unwrap().resolved_ip(id).is_some();
+    if !live {
+        // native 没生效：回滚这条僵尸规则，**保留 dnat**，让调用方稍后重试。
+        {
+            let mut store = st.store.lock().unwrap();
+            store.remove_forward(id);
+            let _ = store.save();
+        }
+        let _ = crate::forward::apply_now(&st.store, &st.nat);
+        return Err(AppError::new(
+            ErrorCode::NftFailure,
+            "native 规则未能解析/生效（如目标域名暂时解析失败），已保留原 dnat 规则，请稍后重试迁移",
+        ));
+    }
+
+    // native 已生效，再撤原 dnat。撤失败不回滚：native（-90）已就绪，dnat（-100）仍在则继续
+    // 服务同一目标，无中断；重试迁移幂等（add_forward 去重 + remove 再试）。
+    if let Err(e) = st.dnat.remove_prefix(&prefix) {
+        return Err(AppError::new(
+            ErrorCode::NftFailure,
+            format!("native 已建好并生效，但移除原 dnat 规则失败（dnat 仍在服务，可重试迁移或手动 dnat-rm）：{e}"),
+        ));
+    }
+
+    let store = st.store.lock().unwrap();
+    Ok(Json(forward_view(
+        &store,
+        rule_by_id(&store, id).unwrap_or(new_rule),
+    )))
 }
 
 /// 列主机网卡（客户端做下拉 + 源 IP 提示）。

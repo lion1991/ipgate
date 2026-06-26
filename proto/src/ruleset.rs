@@ -47,6 +47,10 @@ impl PortRange {
     pub fn is_valid(&self) -> bool {
         self.start <= self.end
     }
+    /// 两闭区间是否相交（端口转发碰撞检测用）。
+    pub fn overlaps(&self, other: &PortRange) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
 }
 
 /// 内核 set 中的一个元素（由 `nft -j list set` 解析得到）。

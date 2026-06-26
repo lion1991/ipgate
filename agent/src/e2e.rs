@@ -106,6 +106,9 @@ fn harness_cfg(require_access_key: bool) -> Harness {
         store,
         backend: backend.clone(),
         nat: Arc::new(MockNat::default()),
+        dnat: Arc::new(crate::dnat::DnatAdapter::new(
+            crate::dnat::DnatAdapterConfig::default(),
+        )),
         auth,
         fingerprint: identity.fingerprint.clone(),
         require_access_key,
@@ -300,7 +303,7 @@ async fn forward_crud_flow() {
     // 初始为空
     let (st, body) = call(&h.app, "GET", "/v1/forwards", Some(&bearer), None).await;
     assert_eq!(st, StatusCode::OK);
-    let list: ForwardList = serde_json::from_slice(&body).unwrap();
+    let list: UnifiedForwardList = serde_json::from_slice(&body).unwrap();
     assert!(list.forwards.is_empty());
     assert_eq!(list.revision, 0);
 
@@ -336,10 +339,14 @@ async fn forward_crud_flow() {
 
     // 列表可读到该条，修订号 +1
     let (_, body) = call(&h.app, "GET", "/v1/forwards", Some(&bearer), None).await;
-    let list: ForwardList = serde_json::from_slice(&body).unwrap();
+    let list: UnifiedForwardList = serde_json::from_slice(&body).unwrap();
     assert_eq!(list.forwards.len(), 1);
     assert_eq!(list.revision, 1);
-    assert_eq!(list.forwards[0].rule.id, id);
+    // 统一视图：native 来源、带 id、全能力、无冲突（无 dnat 共存）。
+    assert_eq!(list.forwards[0].id, Some(id));
+    assert_eq!(list.forwards[0].origin, ForwardOrigin::Ipgate);
+    assert!(list.forwards[0].caps.can_edit && !list.forwards[0].caps.can_migrate);
+    assert!(!list.forwards[0].conflict);
 
     // 删除不存在 → 404
     let (st, _) = call(
@@ -363,7 +370,7 @@ async fn forward_crud_flow() {
     .await;
     assert_eq!(st, StatusCode::NO_CONTENT);
     let (_, body) = call(&h.app, "GET", "/v1/forwards", Some(&bearer), None).await;
-    let list: ForwardList = serde_json::from_slice(&body).unwrap();
+    let list: UnifiedForwardList = serde_json::from_slice(&body).unwrap();
     assert!(list.forwards.is_empty());
 
     let _ = std::fs::remove_dir_all(&h.data_dir);

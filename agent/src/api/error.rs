@@ -25,7 +25,7 @@ fn status(code: ErrorCode) -> StatusCode {
         | ErrorCode::PairingInvalid
         | ErrorCode::ChallengeInvalid => StatusCode::UNAUTHORIZED,
         ErrorCode::BadRequest => StatusCode::BAD_REQUEST,
-        ErrorCode::WouldLockOut => StatusCode::CONFLICT,
+        ErrorCode::WouldLockOut | ErrorCode::Conflict => StatusCode::CONFLICT,
         ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         ErrorCode::NotFound => StatusCode::NOT_FOUND,
         ErrorCode::NftFailure | ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,

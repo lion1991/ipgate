@@ -1,6 +1,6 @@
 [package]
 name = "ipgate-agent"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 publish = false
 description = "ipgate agent —— 运行在远程 Linux 主机上，落地 nftables 放行名单（ADR 0002）。"
@@ -30,6 +30,8 @@ hmac = "0.12"
 sha2 = "0.10"
 getrandom = "0.4.3"
 uuid = "1.23.3"
+# flock(2)：与 dnat 工具的 conf.lock 跨进程互斥（ADR 0006）。
+libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
