@@ -226,7 +226,8 @@ else
   "public_udp": [],
   "data_dir": "/var/lib/ipgate",
   "require_access_key": true,
-  "rate_limit_per_min": 120
+  "rate_limit_per_min": 120,
+  "dnat": { "enabled": true, "base_dir": "/etc/dnat", "bin": "/usr/local/bin/dnat" }
 }
 JSON
   chmod 0644 "$CONF_DIR/config.json"
