@@ -65,6 +65,11 @@ sudo deploy/uninstall.sh --purge # 停服务 + flush 表 + 删数据
 > 否则一律裸 **404**——端口对外「变暗」，扫描器识别不出 ipgate。门挡在路由前；另叠 per-IP 限流（429）。
 > 升级既有部署默认**不开**（保现有客户端不被挡）；开启见 config `require_access_key`。
 
+> **dnat 适配**（`dnat.enabled`，ADR 0006 排空模型）：统一列表纳入外部 dnat 工具创建的转发，
+> 支持查看/删除/「迁移到 agent」。install.sh 写出的默认配置置 `true`，但仅当本机确有 dnat
+> （`base_dir` + `bin` 存在）才激活，否则静默 inert。代码 serde 默认为 `false`——**升级既有部署
+> 不会自动开**，需在 `/etc/ipgate/config.json` 显式加 `"dnat": {"enabled": true}` 并重启。
+
 ```
 POST /v1/pair            配对入网（验签 + 消费配对码）
 POST /v1/auth/challenge  取 nonce
