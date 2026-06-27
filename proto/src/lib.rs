@@ -12,6 +12,7 @@ pub mod entry;
 pub mod error;
 pub mod forward;
 pub mod ids;
+pub mod rpc;
 pub mod ruleset;
 
 pub use auth::*;
@@ -20,13 +21,17 @@ pub use entry::*;
 pub use error::*;
 pub use forward::*;
 pub use ids::*;
+pub use rpc::*;
 pub use ruleset::*;
 
 /// API 路径版本前缀（如 `/v1/allowlist`）。
 pub const API_VERSION: &str = "v1";
 
-/// 管理端口默认值（ADR 0003）。**永不**进受管名单（ADR 0002）。
+/// 管理端口默认值（ADR 0003）。ADR 0007 起仅 loopback 监听 Noise；**永不**进受管名单。
 pub const DEFAULT_MGMT_PORT: u16 = 19186;
+
+/// SSH 管理端口默认值（ADR 0007）：唯一入口，ruleset 无条件放行的自锁不变量端口。
+pub const DEFAULT_SSH_PORT: u16 = 22;
 
 /// nftables 表名（`inet` family）。
 pub const NFT_TABLE: &str = "ipgate";
@@ -92,9 +97,10 @@ mod tests {
     }
 
     #[test]
-    fn default_mgmt_port_is_19186() {
+    fn default_ports() {
         assert_eq!(DEFAULT_MGMT_PORT, 19186);
-        assert_eq!(RulesetConfig::default().mgmt_port, 19186);
+        assert_eq!(DEFAULT_SSH_PORT, 22);
+        assert_eq!(RulesetConfig::default().ssh_port, 22);
     }
 
     #[test]

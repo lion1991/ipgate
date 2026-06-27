@@ -4,7 +4,7 @@
 
 ## 职责
 
-- 对客户端暴露 API：REST/JSON over rustls(TLS 1.3)，TOFU 指纹 + Ed25519 鉴权（[ADR 0003](../docs/adr/0003-transport-auth.md)）。
+- 对客户端暴露 API：**JSON-RPC over Noise_IKpsk0**，仅 loopback 监听、经 **SSH 隧道**访问（[ADR 0007](../docs/adr/0007-noise-over-ssh.md)，取代 0003 的 TLS/REST）。
 - 把放行名单落地到 nftables：`nft` 子进程，全主机 default-drop，独占 `inet ipgate` 表（[ADR 0002](../docs/adr/0002-nftables-backend.md)）。
 - 读取内核实际状态，支持与客户端**同步 (Sync)**。
 - 清理过期条目（agent 对账权威 + 内核 timeout 兜底），记录放行/撤销审计日志。
@@ -17,25 +17,25 @@
 |------|------|
 | `nft` | `NftBackend` trait + `NftCli`（`nft` 子进程）；`ruleset.rs` 渲染 `inet ipgate` 原子事务、`nat.rs` 渲染 `ip ipgate_nat` 转发表（`NatBackend`）、`parse.rs` 解析 `nft -j` |
 | `forward` | 端口转发编排（ADR 0005）：解析目标/网卡/源 → 渲染 → 落地；`resolve` 域名解析、`netinfo` 网卡/默认路由/ip_forward |
-| `config` | `AgentConfig`（bind、mgmt_port、public_tcp/udp、data_dir）+ `validate()` 拒自锁 |
+| `config` | `AgentConfig`（mgmt_port=loopback Noise 口、ssh_port/ssh_user、public_tcp/udp、data_dir）+ `validate()` 拒自锁 |
 | `store` | 条目/设备/转发 JSON 持久化（原子写）+ allow/revoke/prune/设备/转发管理 + 解析缓存 |
 | `reconcile` | 期望态 vs 内核态求 `Diff`（missing/stale/expired） |
 
-面向客户端的半边（ADR 0003）：
+面向客户端的半边（ADR 0007）：
 
 | 模块 | 内容 |
 |------|------|
-| `tls` | 自签证书 load-or-generate（rcgen）+ SPKI SHA-256 指纹（TOFU） |
-| `auth` | `keys`（Ed25519 验签）/ `token`（HMAC 会话令牌）/ `challenge`（单次 nonce）/ `pairing`（配对码，文件跨进程）/ `access`（管理端口访问密钥门） |
-| `api` | axum 路由 + `AppState` + `serve`（over rustls）+ `AuthDevice` Bearer 抽取器 + **访问密钥门 / per-IP 限流中间件** + 错误→HTTP 映射 |
-| `main` | CLI：`run`（守护进程）/ `pair` / `access-key` / `forwards` / `forward-add` / `forward-rm` / `print-ruleset` / `status` / `uninstall` |
+| `noise` | `NoiseIdentity`（X25519 静态密钥，0600 持久化）+ `Noise_IKpsk0` 握手（responder）+ 长度前缀分帧 AEAD 收发 + `derive_psk`（access key→PSK） |
+| `auth` | `pairing`（配对码，文件跨进程、单次限时）/ `access`（访问密钥 = Noise PSK 来源） |
+| `api` | loopback TCP 监听 + `serve`/握手鉴权（含配对）+ **JSON-RPC dispatcher**（`RpcRequest`→handler）+ per-IP 限流 |
+| `main` | CLI：`run`（守护进程）/ `pair [--qr --host]` / `access-key` / `forwards` / `forward-add` / `forward-rm` / `print-ruleset` / `status` / `uninstall` |
 
 ## CLI
 
 ```sh
-ipgate-agent --config <path> pair            # 生成配对口令（启用密钥门时为「访问密钥.配对码」join 串）+ 打印 SPKI 指纹
-ipgate-agent --config <path> access-key      # 打印管理端口访问密钥（--reset 轮换；轮换后需 restart）
-ipgate-agent --config <path> run             # 守护进程：应用 ruleset + 后台对账 + TLS API（需 root + nftables）
+ipgate-agent --config <path> pair [--qr --host <地址>]  # 生成配对口令「访问密钥.配对码」+ 打印 Noise 公钥；--qr 出含隧道凭据的二维码
+ipgate-agent --config <path> access-key      # 打印访问密钥（= Noise 握手 PSK；--reset 轮换后需 restart + 重配对）
+ipgate-agent --config <path> run             # 守护进程：应用 ruleset + 后台对账 + Noise JSON-RPC（loopback，需 root + nftables）
 ipgate-agent --config <path> allow <CIDR>    # 离线放行（写存储，安装时防自锁用；运行中请走 API）
 ipgate-agent --config <path> revoke <CIDR>   # 离线撤销
 ipgate-agent --config <path> forwards        # 列端口转发规则（+ 当前解析 IP）
@@ -53,17 +53,18 @@ ipgate-agent uninstall                       # flush 掉 inet ipgate 表
 ```sh
 deploy/build-release.sh          # cross 交叉编译静态 musl 二进制 → dist/
 # 把 dist/ipgate-agent-<arch> + deploy/* 拷到目标主机后：
-sudo deploy/install.sh           # root；探测 ufw/firewalld、注入 SSH 来源 IP 防自锁、起服务、打印配对码
+sudo deploy/install.sh           # root；探测 ufw/firewalld、生成仅转发隧道密钥、起服务（loopback Noise）、打印配对口令
 sudo deploy/uninstall.sh --purge # 停服务 + flush 表 + 删数据
 ```
 
-> ⚠️ default-drop 一旦生效，除管理端口 19186/established/放行名单/公开端口外**一律拒（含 SSH）**。install.sh 会自动把当前 SSH 来源 IP 加入名单防止锁死。
+> ⚠️ default-drop 一旦生效，除 **SSH 端口（`ssh_port`，默认 22，无条件放行）**/established/放行名单/公开端口外一律拒。SSH 是唯一入口、结构性**不自锁**（ADR 0007）；其余对外服务端口请写进 `public_tcp`。
 
-## API（over rustls，默认 19186）
+## API（JSON-RPC over Noise，仅 loopback；经 SSH 隧道访问，ADR 0007）
 
-> **访问密钥门**（`require_access_key`，全新安装默认开）：所有请求须带 `X-Ipgate-Key: <访问密钥>`，
-> 否则一律裸 **404**——端口对外「变暗」，扫描器识别不出 ipgate。门挡在路由前；另叠 per-IP 限流（429）。
-> 升级既有部署默认**不开**（保现有客户端不被挡）；开启见 config `require_access_key`。
+> **传输**：agent 只在 `127.0.0.1:mgmt_port` 监听 `Noise_IKpsk0`。客户端用单把「仅转发」SSH key
+> 建隧道转发到该口，再跑 Noise 握手。线上只有 SSH 流量——无 TLS、无 HTTP、无公网监听端口。
+> **PSK**（= 访问密钥）混进握手 psk0：不持有者连合法握手都造不出，agent 静默拒绝（端口「变暗」）。
+> **鉴权**：握手即完成——客户端 X25519 静态公钥就是设备身份；新设备须在握手载荷带有效配对码。
 
 > **dnat 适配**（`dnat.enabled`，ADR 0006 排空模型）：统一列表纳入外部 dnat 工具创建的转发，
 > 支持查看/删除/「迁移到 agent」。install.sh 写出的默认配置置 `true`，但仅当本机确有 dnat
@@ -71,17 +72,15 @@ sudo deploy/uninstall.sh --purge # 停服务 + flush 表 + 删数据
 > 不会自动开**，需在 `/etc/ipgate/config.json` 显式加 `"dnat": {"enabled": true}` 并重启。
 
 ```
-POST /v1/pair            配对入网（验签 + 消费配对码）
-POST /v1/auth/challenge  取 nonce
-POST /v1/auth/verify     验签换会话令牌
-GET/POST/DELETE /v1/allowlist   列出 / 放行 / 撤销   （需 Bearer）
-POST /v1/sync            内核 vs 存储差异          （需 Bearer）
-GET/POST /v1/forwards    列出 / 新增端口转发        （需 Bearer，ADR 0005）
-DELETE /v1/forwards/{id} 删除端口转发              （需 Bearer）
-GET  /v1/interfaces      列主机网卡（客户端下拉用）   （需 Bearer）
-GET  /v1/devices         已授权设备               （需 Bearer）
-DELETE /v1/devices/{id}  吊销设备                 （需 Bearer）
-GET  /healthz            存活探针
+握手（一次）：配对 / 设备鉴权折进 Noise 握手（含配对码消费）
+RPC op（握手后，隧道内 JSON）：
+  list_allowlist / allow / revoke           放行名单 列出 / 放行 / 撤销
+  sync                                      内核 vs 存储差异
+  list_forwards / add_forward / remove_forward          端口转发（ADR 0005）
+  remove_dnat / migrate_dnat                dnat 适配（ADR 0006）
+  list_interfaces                           列主机网卡（客户端下拉用）
+  list_devices / revoke_device              已授权设备 / 吊销
+  whoami                                    回报对端 IP（注：SSH 隧道下为 loopback）
 ```
 
 > **端口转发**（ADR 0005）：DNAT/SNAT 落在**独立** `ip ipgate_nat` 表，与放行名单 `inet ipgate`
@@ -91,17 +90,17 @@ GET  /healthz            存活探针
 ## 开发
 
 ```sh
-cargo test                  # 55 项：配对→挑战→验签→放行→撤销 + 端口转发 CRUD 端到端 + 访问密钥门/限流 + nat 渲染
+cargo test                  # 65 项：Noise 握手/配对 + 放行→撤销 + 端口转发 CRUD 端到端（真 TCP+Noise）+ ruleset/nat 渲染
 cargo clippy --all-targets
 cargo run -- --config <cfg> print-ruleset   # 非 Linux 可跑（纯渲染）
-cargo run -- --config <cfg> pair            # 非 Linux 可跑（生成证书+配对码）
+cargo run -- --config <cfg> pair            # 非 Linux 可跑（生成 Noise 密钥 + 配对码）
 ```
 
 ## 待办
 
 - [x] 定 ADR 0002 / 0003
 - [x] 面向内核：`NftBackend` + 幂等重建（坐实不变量）+ 对账 / 存储 / 配置
-- [x] 面向客户端：TLS+TOFU + 鉴权（配对/挑战-应答/会话令牌）+ REST API（axum）
+- [x] 面向客户端：~~TLS+TOFU + REST（axum）~~ → **Noise_IKpsk0 over SSH 隧道 + JSON-RPC**（ADR 0007）
 - [ ] 定 ADR 0004（部署形态）；systemd unit + 安装脚本（`CAP_NET_ADMIN`、探测 ufw/firewalld、flush 选项）
 - [ ] 在一台测试 VPS 上跑通 `run` + 用真实客户端打通配对/放行
 - [x] 管理端口加硬：访问密钥门（端口「变暗」）+ per-IP 限流（ADR 0003 §4）

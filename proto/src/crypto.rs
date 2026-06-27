@@ -69,7 +69,13 @@ b64_newtype!(
 );
 b64_newtype!(
     /// 服务端证书 SPKI 的 SHA-256 指纹；十六进制（可含冒号分隔）。
+    /// ADR 0003 服务端身份；ADR 0007 起被 [`NoisePublicKey`] 取代。
     SpkiFingerprint
+);
+b64_newtype!(
+    /// Noise 静态公钥（X25519）；base64（标准，无填充），解码后 32 字节。
+    /// ADR 0007：取代 SPKI 指纹，作为服务端身份与设备身份的固定对象。
+    NoisePublicKey
 );
 
 secret_newtype!(

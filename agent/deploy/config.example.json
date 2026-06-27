@@ -1,10 +1,11 @@
 {
-  "bind": "0.0.0.0:19186",
+  "bind": "127.0.0.1:19186",
   "mgmt_port": 19186,
+  "ssh_port": 22,
+  "ssh_user": "root",
   "public_tcp": [],
   "public_udp": [],
   "data_dir": "/var/lib/ipgate",
-  "require_access_key": true,
   "rate_limit_per_min": 120,
   "dnat": { "enabled": true, "base_dir": "/etc/dnat", "bin": "/usr/local/bin/dnat" }
 }

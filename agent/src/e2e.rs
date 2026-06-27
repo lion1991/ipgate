@@ -1,23 +1,19 @@
-//! 端到端测试：用 `Router::oneshot` 跑通完整鉴权 + 名单流程（不经真实 socket，
-//! 但覆盖路由 / 抽取器 / 鉴权 / serde / 状态码）。nft 后端用内存 mock。
+//! 端到端测试（ADR 0007）：起 `serve_on` 于临时 loopback 端口，用真实 TCP + Noise
+//! initiator 跑通握手 / 配对 / 鉴权 / JSON-RPC / serde。nft 后端用内存 mock。
 
-use crate::api::{router, AppState};
-use crate::auth::keys::testkit;
-use crate::auth::{challenge, pairing, AuthState};
+use crate::api::{serve_on, AppState, RateLimiter};
+use crate::auth::{pairing, AuthState};
 use crate::config::AgentConfig;
 use crate::nft::{NatBackend, NftBackend, ResolvedForward};
+use crate::noise::{self, NoiseConn};
 use crate::store::Store;
-use crate::tls;
 use crate::util::{random_bytes, to_hex};
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use axum::Router;
 use chrono::Utc;
 use ipgate_proto::*;
 use ipnet::IpNet;
 use std::sync::{Arc, Mutex};
-use tower::ServiceExt;
+use tokio::net::{TcpListener, TcpStream};
 
 /// 内存版 nft 后端。
 #[derive(Default)]
@@ -44,10 +40,7 @@ impl NftBackend for MockNft {
             .lock()
             .unwrap()
             .iter()
-            .map(|t| KernelElement {
-                target: *t,
-                expires_at: None,
-            })
+            .map(|t| KernelElement { target: *t, expires_at: None })
             .collect())
     }
     fn flush(&self) -> anyhow::Result<()> {
@@ -56,7 +49,7 @@ impl NftBackend for MockNft {
     }
 }
 
-/// 内存版转发后端：只记录最近一次落地的规则数，供断言。
+/// 内存版转发后端。
 #[derive(Default)]
 struct MockNat {
     applied: Mutex<Vec<ResolvedForward>>,
@@ -73,241 +66,191 @@ impl NatBackend for MockNat {
     }
 }
 
-struct Harness {
-    app: Router,
+struct Server {
+    addr: std::net::SocketAddr,
     backend: Arc<MockNft>,
-    fingerprint: SpkiFingerprint,
     data_dir: std::path::PathBuf,
-    access_key: String,
+    server_pub: Vec<u8>,
+    psk: [u8; 32],
 }
 
-fn harness() -> Harness {
-    harness_cfg(false)
-}
-
-fn harness_cfg(require_access_key: bool) -> Harness {
+/// 起一个跑在临时 loopback 端口上的 agent。
+async fn spawn() -> Server {
     let data_dir = std::env::temp_dir().join(format!("ipgate-e2e-{}", to_hex(&random_bytes::<8>())));
-    let cfg = AgentConfig {
-        data_dir: data_dir.clone(),
-        require_access_key,
-        ..AgentConfig::default()
-    };
-    let identity = tls::load_or_generate(&data_dir).unwrap();
+    let cfg = AgentConfig { data_dir: data_dir.clone(), ..AgentConfig::default() };
     let backend = Arc::new(MockNft::default());
     let store = Arc::new(Mutex::new(Store::load(&cfg.store_path()).unwrap()));
-    let auth = Arc::new(AuthState::load_or_generate(&data_dir).unwrap());
-    let access_key = auth.access_key.clone();
-    let rate = Arc::new(crate::api::RateLimiter::new(
-        cfg.rate_limit_per_min,
-        std::time::Duration::from_secs(60),
-    ));
+    let auth = AuthState::load_or_generate(&data_dir).unwrap();
+    let psk = noise::derive_psk(&auth.access_key);
+    let identity = noise::NoiseIdentity::load_or_generate(&data_dir).unwrap();
+    let server_pub = identity.public().to_vec();
     let state = AppState {
         cfg: Arc::new(cfg),
         store,
         backend: backend.clone(),
         nat: Arc::new(MockNat::default()),
-        dnat: Arc::new(crate::dnat::DnatAdapter::new(
-            crate::dnat::DnatAdapterConfig::default(),
-        )),
-        auth,
-        fingerprint: identity.fingerprint.clone(),
-        require_access_key,
-        rate,
+        dnat: Arc::new(crate::dnat::DnatAdapter::new(crate::dnat::DnatAdapterConfig::default())),
+        rate: Arc::new(RateLimiter::new(120, std::time::Duration::from_secs(60))),
     };
-    Harness {
-        app: router(state),
-        backend,
-        fingerprint: identity.fingerprint,
-        data_dir,
-        access_key,
-    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_on(state, identity, psk, listener).await;
+    });
+    Server { addr, backend, data_dir, server_pub, psk }
 }
 
-async fn call(
-    app: &Router,
-    method: &str,
-    uri: &str,
-    token: Option<&str>,
-    body: Option<Vec<u8>>,
-) -> (StatusCode, Vec<u8>) {
-    let mut b = Request::builder().method(method).uri(uri);
-    if let Some(t) = token {
-        b = b.header("authorization", format!("Bearer {t}"));
-    }
-    let req = match body {
-        Some(bytes) => b
-            .header("content-type", "application/json")
-            .body(Body::from(bytes))
-            .unwrap(),
-        None => b.body(Body::empty()).unwrap(),
-    };
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
+/// 生成一对设备密钥（private, public）。
+fn gen_device() -> (Vec<u8>, Vec<u8>) {
+    let kp = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+        .generate_keypair()
         .unwrap();
-    (status, bytes.to_vec())
+    (kp.private, kp.public)
 }
 
-fn json<T: serde::Serialize>(v: &T) -> Option<Vec<u8>> {
-    Some(serde_json::to_vec(v).unwrap())
+struct Client {
+    conn: NoiseConn<TcpStream>,
 }
 
-/// 配对 + 登录，返回可用的 Bearer 令牌。
-async fn pair_and_login(
-    h: &Harness,
-    sk: &ed25519_dalek::SigningKey,
-    pubkey: &PublicKey,
-) -> String {
-    let code = pairing::create(&h.data_dir, PAIRING_CODE_TTL_SECS, Utc::now()).unwrap();
-    let pair_req = PairRequest {
-        pairing_code: code.clone(),
-        device_name: "phone".into(),
-        device_pubkey: pubkey.clone(),
-        signature: testkit::sign(sk, &pairing::pair_message(&code)),
-    };
-    let (_, body) = call(&h.app, "POST", "/v1/pair", None, json(&pair_req)).await;
-    let paired: PairResponse = serde_json::from_slice(&body).unwrap();
+async fn connect_with(
+    srv: &Server,
+    device_private: &[u8],
+    hello: HandshakeHello,
+) -> anyhow::Result<Client> {
+    let stream = TcpStream::connect(srv.addr).await?;
+    let (conn, _ack) =
+        noise::connect(stream, &srv.server_pub, device_private, &srv.psk, &hello).await?;
+    Ok(Client { conn })
+}
 
-    let (_, body) = call(
-        &h.app,
-        "POST",
-        "/v1/auth/challenge",
-        None,
-        json(&AuthChallengeRequest {
-            device_id: paired.device_id,
-        }),
-    )
-    .await;
-    let chal: AuthChallengeResponse = serde_json::from_slice(&body).unwrap();
-    let verify_req = AuthVerifyRequest {
-        device_id: paired.device_id,
-        signature: testkit::sign(sk, &challenge::auth_message(&chal.nonce, &h.fingerprint)),
-    };
-    let (_, body) = call(&h.app, "POST", "/v1/auth/verify", None, json(&verify_req)).await;
-    serde_json::from_slice::<AuthVerifyResponse>(&body)
-        .unwrap()
-        .token
-        .as_str()
-        .to_owned()
+impl Client {
+    async fn rpc(&mut self, req: RpcRequest) -> RpcResponse {
+        self.conn.send(&serde_json::to_vec(&req).unwrap()).await.unwrap();
+        serde_json::from_slice(&self.conn.recv().await.unwrap()).unwrap()
+    }
+
+    /// 期望成功并反序列化结果。
+    async fn ok<T: serde::de::DeserializeOwned>(&mut self, req: RpcRequest) -> T {
+        match self.rpc(req).await {
+            RpcResponse::Ok(v) => serde_json::from_value(v).unwrap(),
+            RpcResponse::Err(e) => panic!("期望 Ok，得到 Err：{e:?}"),
+        }
+    }
+}
+
+fn new_code(srv: &Server) -> PairingCode {
+    pairing::create(&srv.data_dir, PAIRING_CODE_TTL_SECS, Utc::now()).unwrap()
 }
 
 #[tokio::test]
-async fn full_pairing_and_allowlist_flow() {
-    let h = harness();
-    let (sk, pubkey) = testkit::keypair(42);
-
-    // 1) 未鉴权访问被拒
-    let (st, _) = call(&h.app, "GET", "/v1/allowlist", None, None).await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED);
-
-    // 2) 烂配对码被拒
-    let bad = PairRequest {
-        pairing_code: PairingCode::from("deadbeef"),
-        device_name: "x".into(),
-        device_pubkey: pubkey.clone(),
-        signature: testkit::sign(&sk, &pairing::pair_message(&PairingCode::from("deadbeef"))),
-    };
-    let (st, _) = call(&h.app, "POST", "/v1/pair", None, json(&bad)).await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED);
-
-    // 3) 正常配对（agent 侧生成配对码 → 客户端签名 → 入网）
-    let code = pairing::create(&h.data_dir, PAIRING_CODE_TTL_SECS, Utc::now()).unwrap();
-    let pair_req = PairRequest {
-        pairing_code: code.clone(),
-        device_name: "phone".into(),
-        device_pubkey: pubkey.clone(),
-        signature: testkit::sign(&sk, &pairing::pair_message(&code)),
-    };
-    let (st, body) = call(&h.app, "POST", "/v1/pair", None, json(&pair_req)).await;
-    assert_eq!(st, StatusCode::OK);
-    let paired: PairResponse = serde_json::from_slice(&body).unwrap();
-
-    // 4) 登录：挑战 → 签名 → 换令牌
-    let (st, body) = call(
-        &h.app,
-        "POST",
-        "/v1/auth/challenge",
-        None,
-        json(&AuthChallengeRequest {
-            device_id: paired.device_id,
-        }),
+async fn pairing_then_allowlist_flow() {
+    let srv = spawn().await;
+    let (priv_, _pub) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("phone".into()) },
     )
-    .await;
-    assert_eq!(st, StatusCode::OK);
-    let chal: AuthChallengeResponse = serde_json::from_slice(&body).unwrap();
+    .await
+    .unwrap();
 
-    let verify_req = AuthVerifyRequest {
-        device_id: paired.device_id,
-        signature: testkit::sign(&sk, &challenge::auth_message(&chal.nonce, &h.fingerprint)),
-    };
-    let (st, body) = call(&h.app, "POST", "/v1/auth/verify", None, json(&verify_req)).await;
-    assert_eq!(st, StatusCode::OK);
-    let token = serde_json::from_slice::<AuthVerifyResponse>(&body)
-        .unwrap()
-        .token;
-    let bearer = token.as_str().to_owned();
-
-    // 5) 带令牌：名单初始为空
-    let (st, body) = call(&h.app, "GET", "/v1/allowlist", Some(&bearer), None).await;
-    assert_eq!(st, StatusCode::OK);
-    let list: Allowlist = serde_json::from_slice(&body).unwrap();
+    let list: Allowlist = cli.ok(RpcRequest::ListAllowlist).await;
     assert!(list.entries.is_empty());
 
-    // 6) 放行一个目标 → 落到 mock 内核
-    let allow_req = AllowRequest {
-        target: "203.0.113.0/24".parse().unwrap(),
-        note: "office".into(),
-        expires_at: None,
-    };
-    let (st, _) = call(&h.app, "POST", "/v1/allowlist", Some(&bearer), json(&allow_req)).await;
-    assert_eq!(st, StatusCode::OK);
-    assert_eq!(h.backend.set.lock().unwrap().len(), 1);
+    let entry: Entry = cli
+        .ok(RpcRequest::Allow(AllowRequest {
+            target: "203.0.113.0/24".parse().unwrap(),
+            note: "office".into(),
+            expires_at: None,
+        }))
+        .await;
+    assert_eq!(entry.target, "203.0.113.0/24".parse().unwrap());
+    assert_eq!(srv.backend.set.lock().unwrap().len(), 1);
 
-    // 7) 名单可读到该条
-    let (_, body) = call(&h.app, "GET", "/v1/allowlist", Some(&bearer), None).await;
-    let list: Allowlist = serde_json::from_slice(&body).unwrap();
+    let list: Allowlist = cli.ok(RpcRequest::ListAllowlist).await;
     assert_eq!(list.entries.len(), 1);
-    assert_eq!(list.entries[0].target, "203.0.113.0/24".parse().unwrap());
 
-    // 8) 撤销 → mock 内核清空
-    let revoke = RevokeRequest::Target("203.0.113.0/24".parse().unwrap());
-    let (st, _) = call(&h.app, "DELETE", "/v1/allowlist", Some(&bearer), json(&revoke)).await;
-    assert_eq!(st, StatusCode::NO_CONTENT);
-    assert!(h.backend.set.lock().unwrap().is_empty());
+    assert!(matches!(
+        cli.rpc(RpcRequest::Revoke(RevokeRequest::Target("203.0.113.0/24".parse().unwrap())))
+            .await,
+        RpcResponse::Ok(_)
+    ));
+    assert!(srv.backend.set.lock().unwrap().is_empty());
 
-    // 9) 设备可列出
-    let (st, body) = call(&h.app, "GET", "/v1/devices", Some(&bearer), None).await;
-    assert_eq!(st, StatusCode::OK);
-    let devices: Vec<Device> = serde_json::from_slice(&body).unwrap();
+    let devices: Vec<Device> = cli.ok(RpcRequest::ListDevices).await;
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].name, "phone");
 
-    let _ = std::fs::remove_dir_all(&h.data_dir);
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
 }
 
-/// 端口转发 CRUD 走通：列表 → 新增（校验）→ 落地 → 删除。
-///
-/// 注：测试机无 `ip`/`nft`，`apply_now` 会把规则当「无法解析网卡 IP」跳过，故只断言
-/// HTTP/存储/serde 这一层（路由、鉴权、校验、修订号、删除），不断言内核生效。
+#[tokio::test]
+async fn known_device_reconnects_and_unpaired_rejected() {
+    let srv = spawn().await;
+    let (priv_, _pub) = gen_device();
+
+    // 首连带配对码 → 入网。
+    {
+        let mut cli = connect_with(
+            &srv,
+            &priv_,
+            HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("phone".into()) },
+        )
+        .await
+        .unwrap();
+        let _: Allowlist = cli.ok(RpcRequest::ListAllowlist).await;
+    }
+
+    // 同设备密钥、无配对码重连 → 成功（已在授权列表）。
+    assert!(
+        connect_with(&srv, &priv_, HandshakeHello::default()).await.is_ok(),
+        "已配对设备应免配对码重连"
+    );
+
+    // 全新密钥、无配对码 → authorize 拒绝 → 不回 msg2 → 客户端握手失败。
+    let (priv2, _) = gen_device();
+    assert!(
+        connect_with(&srv, &priv2, HandshakeHello::default()).await.is_err(),
+        "未配对且无配对码应被拒"
+    );
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+#[tokio::test]
+async fn wrong_pairing_code_rejected() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let res = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello {
+            pairing_code: Some(PairingCode::from("deadbeefdeadbeef")),
+            device_name: Some("x".into()),
+        },
+    )
+    .await;
+    assert!(res.is_err(), "无效配对码应被拒（握手不完成）");
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
 #[tokio::test]
 async fn forward_crud_flow() {
-    let h = harness();
-    let (sk, pubkey) = testkit::keypair(101);
-    let bearer = pair_and_login(&h, &sk, &pubkey).await;
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("x".into()) },
+    )
+    .await
+    .unwrap();
 
-    // 未鉴权被拒
-    let (st, _) = call(&h.app, "GET", "/v1/forwards", None, None).await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED);
-
-    // 初始为空
-    let (st, body) = call(&h.app, "GET", "/v1/forwards", Some(&bearer), None).await;
-    assert_eq!(st, StatusCode::OK);
-    let list: UnifiedForwardList = serde_json::from_slice(&body).unwrap();
+    let list: UnifiedForwardList = cli.ok(RpcRequest::ListForwards).await;
     assert!(list.forwards.is_empty());
     assert_eq!(list.revision, 0);
 
-    // 端口区间长度不一致 → 400
+    // 端口区间长度不一致 → BadRequest
     let bad = AddForwardRequest {
         proto: ForwardProto::Tcp,
         iface: Some("eth0".into()),
@@ -317,10 +260,12 @@ async fn forward_crud_flow() {
         source: ForwardSource::Auto,
         note: String::new(),
     };
-    let (st, _) = call(&h.app, "POST", "/v1/forwards", Some(&bearer), json(&bad)).await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
+    match cli.rpc(RpcRequest::AddForward(bad)).await {
+        RpcResponse::Err(e) => assert_eq!(e.code, ErrorCode::BadRequest),
+        RpcResponse::Ok(_) => panic!("应 BadRequest"),
+    }
 
-    // 合法新增（字面 IP 目标）
+    // 合法新增
     let req = AddForwardRequest {
         proto: ForwardProto::Both,
         iface: Some("eth0".into()),
@@ -330,147 +275,43 @@ async fn forward_crud_flow() {
         source: ForwardSource::Auto,
         note: "web".into(),
     };
-    let (st, body) = call(&h.app, "POST", "/v1/forwards", Some(&bearer), json(&req)).await;
-    assert_eq!(st, StatusCode::OK);
-    let view: ForwardView = serde_json::from_slice(&body).unwrap();
+    let view: ForwardView = cli.ok(RpcRequest::AddForward(req)).await;
     assert_eq!(view.rule.dest_host, "10.0.0.9");
     assert_eq!(view.rule.proto, ForwardProto::Both);
     let id = view.rule.id;
 
-    // 列表可读到该条，修订号 +1
-    let (_, body) = call(&h.app, "GET", "/v1/forwards", Some(&bearer), None).await;
-    let list: UnifiedForwardList = serde_json::from_slice(&body).unwrap();
+    let list: UnifiedForwardList = cli.ok(RpcRequest::ListForwards).await;
     assert_eq!(list.forwards.len(), 1);
     assert_eq!(list.revision, 1);
-    // 统一视图：native 来源、带 id、全能力、无冲突（无 dnat 共存）。
     assert_eq!(list.forwards[0].id, Some(id));
     assert_eq!(list.forwards[0].origin, ForwardOrigin::Ipgate);
-    assert!(list.forwards[0].caps.can_edit && !list.forwards[0].caps.can_migrate);
     assert!(!list.forwards[0].conflict);
 
-    // 删除不存在 → 404
-    let (st, _) = call(
-        &h.app,
-        "DELETE",
-        &format!("/v1/forwards/{}", ForwardId::new()),
-        Some(&bearer),
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::NOT_FOUND);
-
-    // 删除该条 → 204，列表回空
-    let (st, _) = call(
-        &h.app,
-        "DELETE",
-        &format!("/v1/forwards/{id}"),
-        Some(&bearer),
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::NO_CONTENT);
-    let (_, body) = call(&h.app, "GET", "/v1/forwards", Some(&bearer), None).await;
-    let list: UnifiedForwardList = serde_json::from_slice(&body).unwrap();
+    // 删除不存在 → NotFound
+    match cli.rpc(RpcRequest::RemoveForward(ForwardId::new())).await {
+        RpcResponse::Err(e) => assert_eq!(e.code, ErrorCode::NotFound),
+        _ => panic!("应 NotFound"),
+    }
+    // 删除该条 → Ok，列表回空
+    assert!(matches!(cli.rpc(RpcRequest::RemoveForward(id)).await, RpcResponse::Ok(_)));
+    let list: UnifiedForwardList = cli.ok(RpcRequest::ListForwards).await;
     assert!(list.forwards.is_empty());
 
-    let _ = std::fs::remove_dir_all(&h.data_dir);
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
 }
 
 #[tokio::test]
-async fn whoami_reports_observed_peer_ip() {
-    let h = harness();
-    let (sk, pubkey) = testkit::keypair(7);
-    let bearer = pair_and_login(&h, &sk, &pubkey).await;
-
-    // oneshot 不经真实 socket，手动注入 ConnectInfo 模拟对端地址。
-    let addr: std::net::SocketAddr = "203.0.113.9:54321".parse().unwrap();
-    let req = Request::builder()
-        .method("GET")
-        .uri("/v1/whoami")
-        .header("authorization", format!("Bearer {bearer}"))
-        .extension(axum::extract::ConnectInfo(addr))
-        .body(Body::empty())
-        .unwrap();
-    let resp = h.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let who: WhoamiResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(who.ip, addr.ip());
-
-    // 未鉴权应被拒
-    let req = Request::builder()
-        .method("GET")
-        .uri("/v1/whoami")
-        .extension(axum::extract::ConnectInfo(addr))
-        .body(Body::empty())
-        .unwrap();
-    let resp = h.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    let _ = std::fs::remove_dir_all(&h.data_dir);
-}
-
-#[tokio::test]
-async fn rcgen_cert_builds_valid_rustls_config() {
-    // oneshot 测试绕过了 TLS；这里验证自签证书/私钥能被 rustls 接受（catch 密钥格式问题）。
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let dir = std::env::temp_dir().join(format!("ipgate-tlscfg-{}", to_hex(&random_bytes::<8>())));
-    let id = tls::load_or_generate(&dir).unwrap();
-    let cfg = axum_server::tls_rustls::RustlsConfig::from_pem(
-        id.cert_pem.into_bytes(),
-        id.key_pem.into_bytes(),
+async fn whoami_reports_peer_ip() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: None },
     )
-    .await;
-    assert!(cfg.is_ok(), "rustls 应接受 rcgen 生成的证书/私钥");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[tokio::test]
-async fn forged_token_is_rejected() {
-    let h = harness();
-    // 用别的密钥签发的令牌（错 secret）应被拒
-    let forged = crate::auth::token::issue(DeviceId::new(), Utc::now() + chrono::Duration::hours(1), &[1u8; 32]);
-    let (st, _) = call(&h.app, "GET", "/v1/allowlist", Some(forged.as_str()), None).await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED);
-    let _ = std::fs::remove_dir_all(&h.data_dir);
-}
-
-/// 访问密钥门开启时：无/错密钥 → 连 `/healthz`、`/v1/pair` 都是裸 404（端口「变暗」）；
-/// 正确密钥 → 正常放行。门挡在路由/JSON 解析之前。
-#[tokio::test]
-async fn access_gate_darkens_port_without_key() {
-    let h = harness_cfg(true);
-
-    let get_with = |key: Option<&str>| {
-        let mut b = Request::builder().method("GET").uri("/healthz");
-        if let Some(k) = key {
-            b = b.header("x-ipgate-key", k);
-        }
-        b.body(Body::empty()).unwrap()
-    };
-
-    // 无密钥 → 404（不是 200 "ok"，扫描器看不到 ipgate）
-    let resp = h.app.clone().oneshot(get_with(None)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-    // 错密钥 → 404
-    let resp = h.app.clone().oneshot(get_with(Some("deadbeef"))).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-    // 连 /v1/pair 也变暗：无密钥时哪怕发垃圾 body 也只得 404（根本到不了 JSON 解析）
-    let (st, _) = call(&h.app, "POST", "/v1/pair", None, Some(b"garbage".to_vec())).await;
-    assert_eq!(st, StatusCode::NOT_FOUND);
-
-    // 正确密钥 → 放行
-    let resp = h
-        .app
-        .clone()
-        .oneshot(get_with(Some(&h.access_key)))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let _ = std::fs::remove_dir_all(&h.data_dir);
+    .await
+    .unwrap();
+    let who: WhoamiResponse = cli.ok(RpcRequest::Whoami).await;
+    assert!(who.ip.is_loopback(), "本测试经 loopback 连接");
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
 }

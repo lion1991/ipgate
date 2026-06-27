@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use ipgate_proto::{
     AddForwardRequest, AllowRequest, Device, DeviceId, Entry, EntryId, ForwardId, ForwardRule,
+    NoisePublicKey,
 };
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -89,8 +90,9 @@ impl Store {
         self.state.devices.push(device);
     }
 
-    pub fn get_device(&self, id: DeviceId) -> Option<&Device> {
-        self.state.devices.iter().find(|d| d.id == id)
+    /// 按 Noise 静态公钥查设备（ADR 0007：握手鉴权用）。
+    pub fn get_device_by_pubkey(&self, pubkey: &NoisePublicKey) -> Option<&Device> {
+        self.state.devices.iter().find(|d| &d.pubkey == pubkey)
     }
 
     pub fn remove_device(&mut self, id: DeviceId) -> bool {

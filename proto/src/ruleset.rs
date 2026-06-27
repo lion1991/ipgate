@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 /// agent 的 ruleset 配置。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RulesetConfig {
-    /// 管理端口：无条件放行，**永不**进受管名单。
-    pub mgmt_port: u16,
+    /// SSH 管理端口：无条件放行（ADR 0007 自锁不变量——它是唯一入口）。
+    /// Noise 服务仅监听 loopback，命中 `iif lo accept`，不需要也不应有公网放行规则。
+    pub ssh_port: u16,
     /// 对全世界开放的 TCP 端口/区间（默认空）。
     #[serde(default)]
     pub public_tcp: Vec<PortRange>,
@@ -20,7 +21,7 @@ pub struct RulesetConfig {
 impl Default for RulesetConfig {
     fn default() -> Self {
         Self {
-            mgmt_port: crate::DEFAULT_MGMT_PORT,
+            ssh_port: crate::DEFAULT_SSH_PORT,
             public_tcp: Vec::new(),
             public_udp: Vec::new(),
         }

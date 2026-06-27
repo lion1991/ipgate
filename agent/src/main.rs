@@ -10,10 +10,10 @@ mod dnat;
 mod forward;
 mod netinfo;
 mod nft;
+mod noise;
 mod reconcile;
 mod resolve;
 mod store;
-mod tls;
 mod util;
 
 #[cfg(test)]
@@ -30,6 +30,7 @@ use ipgate_proto::{
 };
 use ipnet::IpNet;
 use nft::{NatBackend, NftBackend, NftCli};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -170,11 +171,14 @@ fn main() -> Result<()> {
             println!("{key}");
             if reset {
                 eprintln!(
-                    "已重置访问密钥。运行中的服务需 `systemctl restart ipgate-agent` 才生效；\
-                     现有客户端需用新密钥重配对/更新。"
+                    "已重置访问密钥（= Noise 握手 PSK，ADR 0007）。运行中的服务需 \
+                     `systemctl restart ipgate-agent` 才生效；所有设备需用新口令重新配对。"
                 );
-            } else if !cfg.require_access_key {
-                eprintln!("注意：require_access_key=false，当前未强制此密钥（端口仍匿名可达）。");
+            } else {
+                eprintln!(
+                    "此密钥即 Noise 握手 PSK：不持有它连握手都完不成。配对口令 = 此密钥.配对码\
+                     （见 `ipgate-agent pair`）。"
+                );
             }
         }
         Cmd::Forwards => forwards_cli(&cfg)?,
@@ -207,31 +211,24 @@ fn main() -> Result<()> {
 }
 
 fn pair(cfg: &AgentConfig, qr: bool, host: Option<String>, port: Option<u16>) -> Result<()> {
-    let identity = tls::load_or_generate(&cfg.data_dir)?;
+    let identity = noise::NoiseIdentity::load_or_generate(&cfg.data_dir)?;
+    let nk = identity.public_b64();
     let code = auth::pairing::create(&cfg.data_dir, PAIRING_CODE_TTL_SECS, Utc::now())?;
     let ttl_min = PAIRING_CODE_TTL_SECS / 60;
-    println!("服务端指纹（逐位核对）：{}", identity.fingerprint);
-    // join 串 = 访问密钥.配对码（启用密钥门时）；否则就是配对码本身。客户端粘一次自动拆分。
-    let join = if cfg.require_access_key {
-        let access = auth::access::load_or_generate(&cfg.data_dir)?;
-        println!(
-            "配对口令（{ttl_min} 分钟内有效、单次，粘贴到客户端「配对码」栏）：\n  {}.{}",
-            access,
-            code.as_str()
-        );
-        format!("{}.{}", access, code.as_str())
-    } else {
-        println!("配对码（{ttl_min} 分钟内有效、单次）：{}", code.as_str());
-        println!("（提示：管理端口访问密钥门未开 require_access_key=false；建议开启以让端口对外「变暗」）");
-        code.as_str().to_string()
-    };
+    println!("服务端 Noise 公钥（客户端自动钉死）：{}", nk);
+    // join 串 = 访问密钥.配对码。访问密钥同时是 Noise 握手 PSK（ADR 0007）；客户端粘一次自动拆分。
+    let access = auth::access::load_or_generate(&cfg.data_dir)?;
+    let join = format!("{}.{}", access, code.as_str());
+    println!(
+        "配对口令（{ttl_min} 分钟内有效、单次，粘贴到客户端「配对码」栏）：\n  {join}"
+    );
 
     if qr {
-        let host = host.context("--qr 需配合 --host <地址>（写进二维码、供客户端连接）")?;
+        let host = host.context("--qr 需配合 --host <地址>（写进二维码、供客户端经 SSH 连接）")?;
         let port = port.unwrap_or(cfg.mgmt_port);
-        print_pair_qr(&host, port, &identity.fingerprint.to_string(), &join)?;
+        print_pair_qr(cfg, &host, port, nk.as_str(), &join)?;
     } else {
-        println!("在客户端输入主机地址 + 上面的口令，并核对指纹。");
+        println!("在客户端输入主机地址 + 上面的口令即可（Noise 公钥校验自动完成）。");
     }
     Ok(())
 }
@@ -241,29 +238,41 @@ fn pair(cfg: &AgentConfig, qr: bool, host: Option<String>, port: Option<u16>) ->
 /// payload = `{v,h,p,fp,c}`：版本 / 主机 / 端口 / 指纹（冒号大写）/ join 串。客户端「扫码配对」
 /// 解析后直接 pin `fp`——指纹经二维码（agent 自己屏幕这条可信通道）传达，取代肉眼逐位核对。
 /// 二维码含单次配对码，与上面终端明文打印的 join 串同等敏感（单次 + TTL 失效即作废）。
-fn print_pair_qr(host: &str, port: u16, fingerprint: &str, join: &str) -> Result<()> {
+fn print_pair_qr(cfg: &AgentConfig, host: &str, np: u16, noise_pub: &str, join: &str) -> Result<()> {
     use base64::Engine;
     use qrcode::{render::unicode, EcLevel, QrCode};
 
-    let payload = serde_json::json!({
-        "v": 1,
+    // payload v2（ADR 0007）：版本 / 主机 / SSH 端口(ssh) / SSH 用户(u) / loopback 上的
+    // Noise 端口(np) / Noise 静态公钥(nk) / join 串(c, 含 PSK+配对码) / 受限转发 SSH 私钥
+    // (sk, 存在时)。客户端：以 u@h:ssh 用受限 key 建隧道转发到 127.0.0.1:np → Noise 握手
+    // 钉死 nk → 从 join 拆出 PSK 与配对码。
+    let mut payload = serde_json::json!({
+        "v": 2,
         "h": host,
-        "p": port,
-        "fp": fingerprint,
+        "ssh": cfg.ssh_port,
+        "u": cfg.ssh_user,
+        "np": np,
+        "nk": noise_pub,
         "c": join,
     });
+    match std::fs::read_to_string(cfg.data_dir.join("tunnel_key")) {
+        Ok(sk) => payload["sk"] = serde_json::Value::String(sk),
+        Err(_) => eprintln!(
+            "提示：未找到 {}/tunnel_key —— 二维码不含 SSH 隧道私钥；\
+             请确保客户端已配置隧道凭据（见 deploy/install.sh）。",
+            cfg.data_dir.display()
+        ),
+    }
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?);
     let uri = format!("ipgate://pair#{b64}");
 
     // EcLevel::L：内容是单次短时口令、又显示在可信屏幕上，用最低纠错换更小（更易扫）的码。
     let code = QrCode::with_error_correction_level(uri.as_bytes(), EcLevel::L)
         .context("生成配对二维码失败")?;
-    let img = code
-        .render::<unicode::Dense1x2>()
-        .quiet_zone(true)
-        .build();
-    println!("\n用 ipgate 客户端「扫码配对」扫下面的二维码（含指纹 + 口令，单次有效）：\n{img}");
-    println!("（扫不动可手填：地址 {host}:{port}，口令见上）");
+    let img = code.render::<unicode::Dense1x2>().quiet_zone(true).build();
+    println!("\n用 ipgate 客户端「扫码配对」扫下面的二维码（移动端，含 Noise 公钥 + 口令 + 隧道凭据，单次有效）：\n{img}");
+    // 桌面端无摄像头：把整条 uri 粘进客户端「添加主机」即可（与二维码同等敏感、单次有效）。
+    println!("桌面端（无摄像头）：把下面这条配对链接整条粘到客户端「添加主机」：\n  {uri}");
     Ok(())
 }
 
@@ -596,11 +605,9 @@ fn dnat_migrate_cli(cfg: &AgentConfig, listen: &str, iface: &str) -> Result<()> 
 
 fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
     cfg.validate()?;
-    // rustls（tls-rustls-no-provider）需要进程级 crypto provider。
-    let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let identity = tls::load_or_generate(&cfg.data_dir)?;
-    info!(fingerprint = %identity.fingerprint, "服务端 TLS 指纹（首次连接请核对）");
+    let identity = noise::NoiseIdentity::load_or_generate(&cfg.data_dir)?;
+    info!(noise_pubkey = %identity.public_b64(), "服务端 Noise 公钥（客户端首次配对时钉死）");
 
     let backend: Arc<dyn NftBackend + Send + Sync> = Arc::new(NftCli::new());
     let nat: Arc<dyn NatBackend + Send + Sync> = Arc::new(NftCli::new());
@@ -630,13 +637,9 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
         Err(e) => warn!(error = %e, "端口转发启动落地失败（不影响放行名单与管理端口）"),
     }
 
-    let auth = Arc::new(AuthState::load_or_generate(&cfg.data_dir)?);
-    if !cfg.require_access_key {
-        warn!(
-            "管理端口未启用访问密钥门（require_access_key=false）：配对/挑战等接口对任意 IP 可达。\
-             建议 config.json 置 true，并让客户端带上 `ipgate-agent access-key` 的密钥。"
-        );
-    }
+    // 访问密钥转生为 Noise 握手 PSK（psk0，ADR 0007）：无此密钥连握手都完不成。
+    let auth = AuthState::load_or_generate(&cfg.data_dir)?;
+    let psk = noise::derive_psk(&auth.access_key);
     let cfg = Arc::new(cfg);
 
     // 后台对账线程（阻塞式，独立于 async server）。
@@ -650,7 +653,8 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
         std::thread::spawn(move || forward::resolve_loop(store, nat, interval));
     }
 
-    let addr = cfg.bind;
+    // ADR 0007：只在 loopback 监听 Noise；唯一入口是 SSH 隧道，对外零开放端口。
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, cfg.mgmt_port));
     let dnat = Arc::new(dnat::DnatAdapter::new(cfg.dnat.clone()));
     let state = api::AppState {
         cfg: cfg.clone(),
@@ -658,18 +662,15 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
         backend,
         nat,
         dnat,
-        auth,
-        fingerprint: identity.fingerprint.clone(),
-        require_access_key: cfg.require_access_key,
         rate: Arc::new(api::RateLimiter::new(
             cfg.rate_limit_per_min,
             Duration::from_secs(60),
         )),
     };
-    info!(%addr, "启动 TLS API 服务");
+    info!(%addr, "启动 Noise JSON-RPC 服务（仅 loopback；经 SSH 隧道访问）");
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(api::serve(state, identity, addr))
+    rt.block_on(api::serve(state, identity, psk, addr))
 }
 
 fn reconcile_loop(

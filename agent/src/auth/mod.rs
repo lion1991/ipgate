@@ -1,41 +1,25 @@
-//! 鉴权：设备密钥验签、会话令牌、登录挑战、配对码（ADR 0003）。
+//! 鉴权：配对码 + 管理访问密钥。
+//!
+//! ADR 0007：Noise_IKpsk0 握手取代了 0003 的令牌 / 登录挑战 / 设备 Ed25519 验签——
+//! 握手本身完成双向认证与前向保密。这里只剩两样：
+//! - [`pairing`]：一次性配对码（授权新设备的静态公钥）。
+//! - [`access`]：管理访问密钥——经 `noise::derive_psk` 变成握手 PSK（psk0）。
 
 pub mod access;
-pub mod challenge;
-pub mod keys;
 pub mod pairing;
-pub mod token;
 
-use crate::util::{random_bytes, write_private};
-use anyhow::{anyhow, Result};
-use challenge::ChallengeStore;
+use anyhow::Result;
 use std::path::Path;
 
-/// 运行期鉴权状态：令牌 HMAC 密钥（持久化）+ 内存挑战表 + 管理端口访问密钥。
+/// 运行期鉴权状态（ADR 0007 后只剩访问密钥）。
 pub struct AuthState {
-    pub token_secret: [u8; 32],
-    pub challenges: ChallengeStore,
-    /// 管理 API 访问密钥（预共享口令）；见 [`access`]。
+    /// 管理访问密钥（预共享）；派生 Noise PSK。见 [`access`]。
     pub access_key: String,
 }
 
 impl AuthState {
-    /// 加载令牌密钥与访问密钥；不存在则生成并持久化（0600）。
     pub fn load_or_generate(data_dir: &Path) -> Result<Self> {
-        let path = data_dir.join("secret.bin");
-        let token_secret: [u8; 32] = if path.exists() {
-            std::fs::read(&path)?
-                .try_into()
-                .map_err(|_| anyhow!("secret.bin 长度异常"))?
-        } else {
-            let secret = random_bytes::<32>();
-            std::fs::create_dir_all(data_dir)?;
-            write_private(&path, &secret)?;
-            secret
-        };
         Ok(Self {
-            token_secret,
-            challenges: ChallengeStore::new(),
             access_key: access::load_or_generate(data_dir)?,
         })
     }

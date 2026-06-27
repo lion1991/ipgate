@@ -1,6 +1,7 @@
 //! 配对码：`ipgate-agent pair` 生成、限时、单次；以文件跨进程共享给运行中的 server。
 //!
-//! 文件里只存配对码的 SHA-256（不存明文）。配对时客户端对配对码签名以证明持有私钥。
+//! 文件里只存配对码的 SHA-256（不存明文）。ADR 0007 起，「持有设备私钥」由 Noise
+//! 握手证明（客户端静态公钥随握手送达），这里只管配对码的限时 + 单次消费。
 
 use crate::util::{random_bytes, to_hex, write_private};
 use anyhow::{Context, Result};
@@ -9,17 +10,6 @@ use ipgate_proto::PairingCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-
-const DOMAIN: &[u8] = b"ipgate-pair-v1";
-
-/// 配对时的待签消息（客户端用设备私钥签它）。
-pub fn pair_message(code: &PairingCode) -> Vec<u8> {
-    let mut m = Vec::new();
-    m.extend_from_slice(DOMAIN);
-    m.push(0);
-    m.extend_from_slice(code.as_str().as_bytes());
-    m
-}
 
 fn code_hash(code: &PairingCode) -> String {
     to_hex(&Sha256::digest(code.as_str().as_bytes()))

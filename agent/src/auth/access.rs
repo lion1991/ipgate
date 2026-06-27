@@ -1,8 +1,8 @@
-//! 管理 API 访问密钥（预共享口令）：让管理端口对**无密钥者「变暗」**。
+//! 管理访问密钥（128-bit）：ADR 0007 起它被 `noise::derive_psk` 派生成 Noise 握手的
+//! PSK（psk0）——不持此密钥者连合法 msg1 都造不出、本方静默拒绝（端口「变暗」）。
 //!
-//! 不变量背书（与 ADR 0003 不冲突）：访问密钥是**应用层**前置门，只挡 19186 的 HTTP；
-//! 本地 `ipgate-agent` CLI 直接读写磁盘、SSH(22) 受名单管，二者都不经此门 —— 所以它
-//! **永远不会**新增一条把人锁到 VNC 的路径。丢了密钥：SSH 进去 `ipgate-agent access-key --reset`。
+//! 不变量：本地 `ipgate-agent` CLI 直接读写磁盘、SSH(22) 走系统认证，都不经此密钥；
+//! 丢了：SSH 进去 `ipgate-agent access-key --reset` 重置，再重新配对各设备。
 
 use crate::util::{random_bytes, to_hex, write_private};
 use anyhow::{anyhow, Result};
@@ -40,18 +40,6 @@ pub fn reset(data_dir: &Path) -> Result<String> {
     generate(data_dir)
 }
 
-/// 常数时间比较（定长密钥，长度本身非秘密）。挡时序侧信道。
-pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,13 +59,5 @@ mod tests {
         let c = reset(&dir).unwrap();
         assert_ne!(a, c, "reset 应换新");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn ct_eq_basic() {
-        assert!(ct_eq(b"abc", b"abc"));
-        assert!(!ct_eq(b"abc", b"abd"));
-        assert!(!ct_eq(b"abc", b"ab")); // 长度不同
-        assert!(!ct_eq(b"", b"x"));
     }
 }
