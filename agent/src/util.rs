@@ -16,15 +16,6 @@ pub fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// 冒号分隔的大写十六进制（指纹展示用）。
-pub fn to_hex_colon(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|b| format!("{b:02X}"))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
 /// 写文件并在 unix 上设 0600（私钥/密钥用）。
 pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)?;
@@ -43,7 +34,6 @@ mod tests {
     #[test]
     fn hex_roundtrips_shape() {
         assert_eq!(to_hex(&[0x0a, 0xff]), "0aff");
-        assert_eq!(to_hex_colon(&[0x0a, 0xff]), "0A:FF");
     }
 
     #[test]

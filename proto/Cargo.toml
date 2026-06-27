@@ -10,6 +10,5 @@ serde = { version = "1", features = ["derive"] }
 ipnet = { version = "2", features = ["serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-
-[dev-dependencies]
+# RpcResponse::Ok 承载任意 op 的成功负载（按 op 反序列化）；线协议依赖（ADR 0007）。
 serde_json = "1"

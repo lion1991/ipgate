@@ -127,8 +127,9 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
     s.push_str(&format!(
         "        ip protocol icmp icmp type {{ {ICMP_INFRA_TYPES} }} accept\n"
     ));
-    // 管理端口：无条件放行（ADR 0003 不变量），字面规则、不可被 API 移除。
-    s.push_str(&format!("        tcp dport {} accept\n", cfg.mgmt_port));
+    // SSH 管理端口：无条件放行（ADR 0007 自锁不变量）——它是唯一入口，字面规则、不可被
+    // API 移除。Noise 服务仅 loopback，命中上面 `iif lo accept`，无需任何公网放行规则。
+    s.push_str(&format!("        tcp dport {} accept\n", cfg.ssh_port));
     s.push_str(&format!("        tcp dport @{NFT_SET_PUBLIC_TCP} accept\n"));
     s.push_str(&format!("        udp dport @{NFT_SET_PUBLIC_UDP} accept\n"));
     s.push_str(&format!("        ip saddr @{NFT_SET_ALLOW4} accept\n"));
@@ -183,8 +184,8 @@ mod tests {
         let s = render_apply(&cfg, &[], Utc::now());
         // default-drop
         assert!(s.contains("policy drop;"));
-        // 管理端口字面放行（不变量）
-        assert!(s.contains("tcp dport 19186 accept"));
+        // SSH 端口字面放行（ADR 0007 自锁不变量）
+        assert!(s.contains("tcp dport 22 accept"));
         // 连接跟踪 / loopback
         assert!(s.contains("ct state established,related accept"));
         assert!(s.contains("iif lo accept"));
@@ -238,7 +239,7 @@ mod tests {
     #[test]
     fn public_ports_rendered_as_ranges() {
         let cfg = RulesetConfig {
-            mgmt_port: 19186,
+            ssh_port: 22,
             public_tcp: vec![PortRange::single(443), PortRange { start: 8000, end: 8010 }],
             public_udp: vec![],
         };

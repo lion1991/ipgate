@@ -1,6 +1,6 @@
 [package]
 name = "ipgate-agent"
-version = "0.1.11"
+version = "0.2.0"
 edition = "2021"
 publish = false
 description = "ipgate agent —— 运行在远程 Linux 主机上，落地 nftables 放行名单（ADR 0002）。"
@@ -19,14 +19,8 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
-axum = "0.8.9"
-axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
-rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
-rcgen = "0.14.8"
-ed25519-dalek = "2.2.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util"] }
 base64 = "0.22.1"
-hmac = "0.12"
 sha2 = "0.10"
 getrandom = "0.4.3"
 uuid = "1.23.3"
@@ -34,6 +28,6 @@ uuid = "1.23.3"
 libc = "0.2"
 # 配对二维码（`pair --qr`）：纯 Rust 渲染终端 Unicode 二维码，不拉 image/svg。
 qrcode = { version = "0.14", default-features = false }
+# Noise_IKpsk0 传输（ADR 0007）：纯 Rust，取代 rustls/rcgen 的 TLS。
+snow = "0.10"
 
-[dev-dependencies]
-tower = { version = "0.5.3", features = ["util"] }

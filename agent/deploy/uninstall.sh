@@ -48,7 +48,17 @@ fi
 rm -f "$PREFIX/ipgate-agent"
 log "已删除二进制。"
 
-if [ "$PURGE" = 1 ] || confirm "删除配置与数据（$CONF_DIR, $DATA_DIR：含证书/密钥/名单）?"; then
+# 移除安装时写入的「仅转发」SSH 隧道公钥（标记 ipgate-tunnel，ADR 0007）。趁 config 还在先读 ssh_user。
+suser="$(grep -o '"ssh_user"[^,]*' "$CONF_DIR/config.json" 2>/dev/null | sed 's/.*: *"//; s/".*//')"
+suser="${suser:-root}"
+home="$(getent passwd "$suser" 2>/dev/null | cut -d: -f6)"; [ -n "$home" ] || home="/root"
+akf="$home/.ssh/authorized_keys"
+if [ -f "$akf" ] && grep -qF "ipgate-tunnel" "$akf" 2>/dev/null; then
+  grep -vF "ipgate-tunnel" "$akf" > "$akf.tmp" && mv "$akf.tmp" "$akf" && chmod 600 "$akf"
+  log "已从 $suser 的 authorized_keys 移除仅转发隧道公钥。"
+fi
+
+if [ "$PURGE" = 1 ] || confirm "删除配置与数据（$CONF_DIR, $DATA_DIR：含密钥/名单）?"; then
   rm -rf "$CONF_DIR" "$DATA_DIR"
   log "已删除配置与数据。"
 else

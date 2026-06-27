@@ -103,6 +103,34 @@ collect_admin_ips() {
   } 2>/dev/null | grep -vE '^$|^:0' | sort -u
 }
 
+# 生成「仅转发」SSH 隧道密钥（ADR 0007）。客户端经 SSH 隧道把本机 loopback 的 Noise 口转出去；
+# 这把 key 单把共享、强制 command=/bin/false + restrict + 仅 permitopen 到 Noise 口——即便泄露
+# 也只换来「到达 Noise 口」，仍须 Noise 设备鉴权才能下命令。私钥存 $DATA_DIR/tunnel_key，由
+# `ipgate-agent pair --qr` 嵌进二维码发给客户端。
+provision_tunnel_key() {
+  local np="${1:-19186}" suser="${2:-root}" key="$DATA_DIR/tunnel_key"
+  if ! command -v ssh-keygen >/dev/null 2>&1; then
+    warn "未找到 ssh-keygen，跳过隧道密钥生成；客户端需手工配置 SSH 凭据。"
+    return 0
+  fi
+  [ -f "$key" ] || { log "生成 SSH 隧道密钥（仅转发）-> $key"; ssh-keygen -t ed25519 -N "" -C "ipgate-tunnel" -f "$key" >/dev/null; }
+  chmod 600 "$key"
+  local home akf pub entry
+  home="$(getent passwd "$suser" 2>/dev/null | cut -d: -f6)"; [ -n "$home" ] || home="/root"
+  akf="$home/.ssh/authorized_keys"
+  mkdir -p "$home/.ssh"; chmod 700 "$home/.ssh"
+  pub="$(cat "$key.pub")"
+  # 受限前缀：强制空命令 + restrict（关 pty/agent/x11/转发）+ 仅许转发到 loopback Noise 口。
+  entry="command=\"/bin/false\",restrict,permitopen=\"127.0.0.1:$np\" $pub"
+  touch "$akf"; chmod 600 "$akf"
+  # 幂等：删旧 ipgate-tunnel 条目（公钥注释含 ipgate-tunnel）再写新（端口可能变）。
+  grep -vF "ipgate-tunnel" "$akf" 2>/dev/null > "$akf.tmp" || true
+  mv "$akf.tmp" "$akf"; chmod 600 "$akf"
+  printf '%s\n' "$entry" >> "$akf"
+  chown -R "$suser":"$(id -gn "$suser" 2>/dev/null || echo "$suser")" "$home/.ssh" 2>/dev/null || true
+  log "已为用户 $suser 安装仅转发隧道公钥（permitopen 127.0.0.1:$np）。"
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --binary)  BIN_SRC="$2"; shift 2 ;;
@@ -220,12 +248,13 @@ else
   # 同目录没有模板（如 curl|bash 或只下了二进制）→ 内置默认，保持自包含。
   cat > "$CONF_DIR/config.json" <<'JSON'
 {
-  "bind": "0.0.0.0:19186",
+  "bind": "127.0.0.1:19186",
   "mgmt_port": 19186,
+  "ssh_port": 22,
+  "ssh_user": "root",
   "public_tcp": [],
   "public_udp": [],
   "data_dir": "/var/lib/ipgate",
-  "require_access_key": true,
   "rate_limit_per_min": 120,
   "dnat": { "enabled": true, "base_dir": "/etc/dnat", "bin": "/usr/local/bin/dnat" }
 }
@@ -237,26 +266,25 @@ fi
 mkdir -p "$DATA_DIR"
 chmod 0700 "$DATA_DIR"
 
-# --- 防自锁：把管理来源 IP（SSH 等）加入放行名单 ---
-# default-drop 一旦生效，除管理端口/established/名单/公开端口外一律拒新建连接，含 SSH！
+# --- 生成仅转发 SSH 隧道密钥（ADR 0007）---
+np_cfg="$(grep -o '"mgmt_port"[^,]*' "$CONF_DIR/config.json" | grep -o '[0-9][0-9]*' | head -1)"
+suser_cfg="$(grep -o '"ssh_user"[^,]*' "$CONF_DIR/config.json" | sed 's/.*: *"//; s/".*//')"
+provision_tunnel_key "${np_cfg:-19186}" "${suser_cfg:-root}"
+
+# --- SSH 不会自锁（ADR 0007）---
+# ruleset 无条件放行 ssh_port（默认 22），故 default-drop 生效后 SSH 仍可从任意 IP 连入
+# （由 SSH 自身密钥鉴权保护）。下面把识别到的管理 IP 也加进名单仅作额外便利（访问其他服务）。
 admin_ips="$(collect_admin_ips)"
 if [ -n "$admin_ips" ]; then
-  warn "default-drop 启用后仅放行名单内的源 IP 可新建连接（含 SSH）。"
   while IFS= read -r aip; do
     [ -z "$aip" ] && continue
     case "$aip" in *:*) c="$aip/128" ;; *) c="$aip/32" ;; esac
-    if "$PREFIX/ipgate-agent" --config "$CONF_DIR/config.json" allow "$c" --note "installer: admin/SSH"; then
-      log "已放行管理来源 $c"
-    else
-      warn "跳过无法识别的来源: $aip"
-    fi
+    "$PREFIX/ipgate-agent" --config "$CONF_DIR/config.json" allow "$c" --note "installer: admin" \
+      && log "已额外放行管理来源 $c" || warn "跳过无法识别的来源: $aip"
   done <<<"$admin_ips"
-else
-  warn "未能自动识别管理来源 IP（sudo 清掉了 SSH_CONNECTION、curl|bash 无 tty、或本地控制台）。"
-  warn "为防自锁：用 --allow <你的IP> 指定，或 sudo -E 重跑，或装完立即 ipgate-agent allow <IP>/32。"
-  warn "若本机对外提供 Web 等服务，务必把 80/443 写进 config.json 的 public_tcp！"
-  confirm "了解风险并继续?" || die "已取消。"
 fi
+warn "SSH（ssh_port，默认 22）已由 ruleset 无条件放行，default-drop 不会锁死 SSH。"
+warn "若本机对外提供 Web 等服务，务必把 80/443 写进 config.json 的 public_tcp！"
 
 # --- 安装 systemd unit ---
 log "安装 systemd unit"
@@ -311,13 +339,15 @@ dev_count="$("$PREFIX/ipgate-agent" --config "$CONF_DIR/config.json" status 2>/d
   | sed -n 's/.*设备：\([0-9]*\).*/\1/p')"
 [ -z "$dev_count" ] && dev_count=0
 if [ "$dev_count" -gt 0 ] 2>/dev/null; then
-  log "升级完成（已有 $dev_count 个已配对设备，无需重新配对）。"
+  log "升级完成（已有 $dev_count 个已配对设备）。"
+  warn "若是从 TLS 版升级到 Noise 版（ADR 0007），所有设备需用新客户端重新配对。"
 else
-  log "生成首个配对口令（供客户端入网；含访问密钥，端口已对外「变暗」）:"
+  log "生成首个配对口令（供客户端入网）:"
   "$PREFIX/ipgate-agent" --config "$CONF_DIR/config.json" pair || true
   echo
-  log "把上面整串「访问密钥.配对码」粘到客户端「配对码」栏，并逐位核对指纹。"
-  log "（随时可重印访问密钥: ipgate-agent access-key；重置: ipgate-agent access-key --reset 后 restart）"
+  log "把上面整串「访问密钥.配对码」粘到客户端「配对码」栏（Noise 公钥校验自动完成）。"
+  log "扫码配对（移动端一步入网，含隧道凭据）: ipgate-agent pair --qr --host <你的服务器地址>"
+  log "（随时重印访问密钥: ipgate-agent access-key；重置: ipgate-agent access-key --reset 后 restart）"
 fi
 echo
 log "完成。校验 ruleset: nft list table inet ipgate"

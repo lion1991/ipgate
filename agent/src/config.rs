@@ -1,7 +1,7 @@
 //! agent 配置。
 
 use anyhow::{bail, Context, Result};
-use ipgate_proto::{PortRange, RulesetConfig, DEFAULT_MGMT_PORT};
+use ipgate_proto::{PortRange, RulesetConfig, DEFAULT_MGMT_PORT, DEFAULT_SSH_PORT};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -9,10 +9,14 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
-    /// API 监听地址（默认 `0.0.0.0:19186`）。
+    /// 已弃用（ADR 0007）：Noise 服务恒绑 `127.0.0.1:mgmt_port`，此字段不再决定监听地址。
     pub bind: SocketAddr,
-    /// 管理端口：写入 ruleset 的字面放行端口，**永不**进受管名单。应与 `bind` 端口一致。
+    /// Noise 服务在 loopback 上监听的端口（SSH 隧道转发到此）。**永不**进受管名单。
     pub mgmt_port: u16,
+    /// SSH 管理端口：ruleset 无条件放行的自锁不变量端口（ADR 0007，唯一入口）。默认 22。
+    pub ssh_port: u16,
+    /// SSH 隧道登录用户（客户端经它建隧道、转发到本机 Noise 口；写进配对二维码）。默认 root。
+    pub ssh_user: String,
     /// 对全世界开放的 TCP 端口/区间。
     pub public_tcp: Vec<PortRange>,
     /// 对全世界开放的 UDP 端口/区间。
@@ -35,6 +39,8 @@ impl Default for AgentConfig {
         Self {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_MGMT_PORT),
             mgmt_port: DEFAULT_MGMT_PORT,
+            ssh_port: DEFAULT_SSH_PORT,
+            ssh_user: "root".to_string(),
             public_tcp: Vec::new(),
             public_udp: Vec::new(),
             data_dir: PathBuf::from("/var/lib/ipgate"),
@@ -61,7 +67,10 @@ impl AgentConfig {
     /// 校验不变量：管理端口不能为 0，否则会把自己锁死（ADR 0002/0003）。
     pub fn validate(&self) -> Result<()> {
         if self.mgmt_port == 0 {
-            bail!("mgmt_port 不能为 0（会挡住管理端口、锁死自己）");
+            bail!("mgmt_port 不能为 0（Noise loopback 监听端口）");
+        }
+        if self.ssh_port == 0 {
+            bail!("ssh_port 不能为 0（ruleset 靠它放行 SSH——唯一入口，置 0 会锁死自己）");
         }
         for p in self.public_tcp.iter().chain(&self.public_udp) {
             if !p.is_valid() {
@@ -73,7 +82,7 @@ impl AgentConfig {
 
     pub fn ruleset(&self) -> RulesetConfig {
         RulesetConfig {
-            mgmt_port: self.mgmt_port,
+            ssh_port: self.ssh_port,
             public_tcp: self.public_tcp.clone(),
             public_udp: self.public_udp.clone(),
         }
@@ -89,11 +98,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_uses_19186() {
+    fn default_ports() {
         let c = AgentConfig::default();
         assert_eq!(c.mgmt_port, 19186);
-        assert_eq!(c.bind.port(), 19186);
-        assert_eq!(c.ruleset().mgmt_port, 19186);
+        assert_eq!(c.ssh_port, 22);
+        assert_eq!(c.ruleset().ssh_port, 22);
         c.validate().unwrap();
     }
 
@@ -101,6 +110,15 @@ mod tests {
     fn rejects_zero_mgmt_port() {
         let c = AgentConfig {
             mgmt_port: 0,
+            ..AgentConfig::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_ssh_port() {
+        let c = AgentConfig {
+            ssh_port: 0,
             ..AgentConfig::default()
         };
         assert!(c.validate().is_err());
