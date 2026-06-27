@@ -137,6 +137,18 @@ enum Cmd {
         #[arg(long)]
         iface: String,
     },
+    /// 切换 SSH 端口暴露模式（控制台救援用）：写存储 + 立刻重建 ruleset。
+    ///
+    /// 自锁恢复：若误把 SSH 收成「仅名单」而当前 IP 不在名单、连不上了，从 VPS 控制台跑
+    /// `ipgate-agent ssh-expose --open` 即可放开。运行中的服务建议随后 restart 同步内存态。
+    SshExpose {
+        /// 对所有人开放 SSH（解除「仅名单」自锁）。
+        #[arg(long, conflicts_with = "allowlist")]
+        open: bool,
+        /// 仅放行名单内源 IP 可连 SSH。
+        #[arg(long)]
+        allowlist: bool,
+    },
     /// 打印将要应用的 nftables ruleset（不改内核，便于审计）。
     PrintRuleset,
     /// 显示存储条目与内核 set 当前状态。
@@ -198,9 +210,14 @@ fn main() -> Result<()> {
             let store = Store::load(&cfg.store_path())?;
             print!(
                 "{}",
-                nft::render_apply(&cfg.ruleset(), store.entries(), Utc::now())
+                nft::render_apply(
+                    &cfg.ruleset_with(store.ssh_allowlist_only()),
+                    store.entries(),
+                    Utc::now()
+                )
             );
         }
+        Cmd::SshExpose { open, allowlist } => ssh_expose_cli(&cfg, open, allowlist)?,
         Cmd::Status => status(&cfg)?,
         Cmd::Uninstall => {
             NftCli::new().flush()?;
@@ -243,9 +260,10 @@ fn print_pair_qr(cfg: &AgentConfig, host: &str, np: u16, noise_pub: &str, join: 
     use qrcode::{render::unicode, EcLevel, QrCode};
 
     // payload v2（ADR 0007）：版本 / 主机 / SSH 端口(ssh) / SSH 用户(u) / loopback 上的
-    // Noise 端口(np) / Noise 静态公钥(nk) / join 串(c, 含 PSK+配对码) / 受限转发 SSH 私钥
-    // (sk, 存在时)。客户端：以 u@h:ssh 用受限 key 建隧道转发到 127.0.0.1:np → Noise 握手
-    // 钉死 nk → 从 join 拆出 PSK 与配对码。
+    // Noise 端口(np) / Noise 静态公钥(nk) / join 串(c, 含 PSK+配对码) / 受限转发 SSH 私钥的
+    // 32 字节 ed25519 种子(sk, base64, 存在时)。客户端：以 u@h:ssh 用受限 key 建隧道转发到
+    // 127.0.0.1:np → Noise 握手钉死 nk → 从 join 拆出 PSK 与配对码。
+    // 只放种子（而非整段 PEM）让二维码小一大半——客户端用 from_seed 重建同一把私钥。
     let mut payload = serde_json::json!({
         "v": 2,
         "h": host,
@@ -256,7 +274,17 @@ fn print_pair_qr(cfg: &AgentConfig, host: &str, np: u16, noise_pub: &str, join: 
         "c": join,
     });
     match std::fs::read_to_string(cfg.data_dir.join("tunnel_key")) {
-        Ok(sk) => payload["sk"] = serde_json::Value::String(sk),
+        Ok(pem) => match crate::util::extract_ed25519_seed(&pem) {
+            Ok(seed) => {
+                let sk = base64::engine::general_purpose::STANDARD_NO_PAD.encode(seed);
+                payload["sk"] = serde_json::Value::String(sk);
+            }
+            Err(e) => eprintln!(
+                "提示：解析 {}/tunnel_key 失败（{e}）—— 二维码不含 SSH 隧道私钥；\
+                 请确保客户端已配置隧道凭据（见 deploy/install.sh）。",
+                cfg.data_dir.display()
+            ),
+        },
         Err(_) => eprintln!(
             "提示：未找到 {}/tunnel_key —— 二维码不含 SSH 隧道私钥；\
              请确保客户端已配置隧道凭据（见 deploy/install.sh）。",
@@ -619,7 +647,7 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
         if !s.prune_expired(Utc::now()).is_empty() {
             s.save()?;
         }
-        backend.apply(&cfg.ruleset(), s.entries())?;
+        backend.apply(&cfg.ruleset_with(s.ssh_allowlist_only()), s.entries())?;
     }
     info!("ruleset 已应用");
 
@@ -682,12 +710,12 @@ fn reconcile_loop(
     loop {
         std::thread::sleep(Duration::from_secs(interval));
         let now = Utc::now();
-        let entries = {
+        let (entries, ssh_allowlist_only) = {
             let mut s = store.lock().unwrap();
             if !s.prune_expired(now).is_empty() {
                 let _ = s.save();
             }
-            s.entries().to_vec()
+            (s.entries().to_vec(), s.ssh_allowlist_only())
         };
         match backend.list() {
             Ok(kernel) => {
@@ -710,10 +738,33 @@ fn reconcile_loop(
             }
             Err(e) => {
                 warn!(error = %e, "对账读取内核失败，全量重建");
-                let _ = backend.apply(&cfg.ruleset(), &entries);
+                let _ = backend.apply(&cfg.ruleset_with(ssh_allowlist_only), &entries);
             }
         }
     }
+}
+
+/// 控制台救援：切换 SSH 暴露模式，写存储并立刻重建 ruleset（服务在跑与否都可用）。
+fn ssh_expose_cli(cfg: &AgentConfig, open: bool, allowlist: bool) -> Result<()> {
+    let on = match (open, allowlist) {
+        (true, false) => false, // --open => 不限名单
+        (false, true) => true,  // --allowlist => 仅名单
+        _ => anyhow::bail!("请二选一指定 --open（对所有人开放）或 --allowlist（仅放行名单）"),
+    };
+    let mut store = Store::load(&cfg.store_path())?;
+    store.set_ssh_allowlist_only(on);
+    store.save()?;
+    // 直接落内核（救援场景：可能没有运行中的服务来对账）。
+    NftCli::new().apply(&cfg.ruleset_with(on), store.entries())?;
+    if on {
+        println!("已设为：SSH 端口仅放行名单内源 IP 可连。");
+    } else {
+        println!("已设为：SSH 端口对所有人开放。");
+    }
+    eprintln!(
+        "若 ipgate-agent 服务正在运行，请执行 `systemctl restart ipgate-agent` 同步其内存状态。"
+    );
+    Ok(())
 }
 
 fn status(cfg: &AgentConfig) -> Result<()> {

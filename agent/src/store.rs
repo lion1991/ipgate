@@ -29,6 +29,10 @@ pub struct State {
     /// 上次成功解析的转发目标 IP（域名解析失败时回退用，对齐动态域名诉求）。
     #[serde(default)]
     pub resolved: HashMap<ForwardId, Ipv4Addr>,
+    /// SSH 端口是否仅对放行名单开放（ADR 0007）。默认 false=对所有人开放（防自锁）；
+    /// 客户端可经 `SetSshExposure` 切换。运行期可调，故存这里而非静态 config.json。
+    #[serde(default)]
+    pub ssh_allowlist_only: bool,
 }
 
 pub struct Store {
@@ -121,6 +125,19 @@ impl Store {
         self.state.entries.push(entry.clone());
         self.state.revision += 1;
         entry
+    }
+
+    // ---- SSH 端口暴露模式（ADR 0007）----
+
+    pub fn ssh_allowlist_only(&self) -> bool {
+        self.state.ssh_allowlist_only
+    }
+
+    /// 设置 SSH 暴露模式；返回是否发生了变化（便于调用方决定是否需要重建 ruleset）。
+    pub fn set_ssh_allowlist_only(&mut self, on: bool) -> bool {
+        let changed = self.state.ssh_allowlist_only != on;
+        self.state.ssh_allowlist_only = on;
+        changed
     }
 
     pub fn revoke_by_target(&mut self, target: &IpNet) -> bool {

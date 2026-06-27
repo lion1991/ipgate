@@ -9,9 +9,10 @@ use super::AppState;
 use crate::reconcile;
 use chrono::Utc;
 use ipgate_proto::{
-    validate_ports, AddForwardRequest, AllowRequest, Allowlist, ApiError, Device, DeviceId, Diff,
-    Entry, ErrorCode, ForwardCaps, ForwardId, ForwardOrigin, ForwardRule, ForwardView,
-    InterfaceInfo, RevokeRequest, UnifiedForwardList, UnifiedForwardView, WhoamiResponse,
+    validate_ports, AddForwardRequest, AgentSettings, AllowRequest, Allowlist, ApiError, Device,
+    DeviceId, Diff, Entry, ErrorCode, ForwardCaps, ForwardId, ForwardOrigin, ForwardRule,
+    ForwardView, InterfaceInfo, RevokeRequest, UnifiedForwardList, UnifiedForwardView,
+    WhoamiResponse,
 };
 use std::net::IpAddr;
 
@@ -79,6 +80,48 @@ pub fn sync(st: &AppState) -> ApiResult<Diff> {
         .map_err(|e| ApiError::new(ErrorCode::NftFailure, e.to_string()))?;
     let store = st.store.lock().unwrap();
     Ok(reconcile::diff(store.entries(), &kernel, now))
+}
+
+// ---- agent 设置（SSH 端口暴露模式）----
+
+pub fn get_settings(st: &AppState) -> AgentSettings {
+    AgentSettings {
+        ssh_allowlist_only: st.store.lock().unwrap().ssh_allowlist_only(),
+        ssh_port: st.cfg.ssh_port,
+    }
+}
+
+/// 切换 SSH 端口暴露模式并整表重建 ruleset。
+///
+/// 开启「仅名单」前的自锁防护：名单为空必然把所有人（含发起方自己）挡在 SSH 外（连管理
+/// 隧道也走 SSH），直接拒绝。名单非空时仍可能漏掉发起方的真实出口 IP——那一层由可信客户端
+/// 在调用前核对「当前外网 IP ∈ 名单」兜底（agent 经隧道只见 loopback，无法自证）。
+pub fn set_ssh_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<AgentSettings> {
+    let now = Utc::now();
+    let entries = {
+        let mut store = st.store.lock().unwrap();
+        if allowlist_only {
+            let live = store.entries().iter().filter(|e| !e.is_expired(now)).count();
+            if live == 0 {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    "放行名单为空：开启「SSH 仅名单可连」会把所有人（含你自己）挡在外。请先放行你的 IP 再开启。",
+                ));
+            }
+        }
+        store.set_ssh_allowlist_only(allowlist_only);
+        store.save().map_err(internal)?;
+        store.entries().to_vec()
+    };
+    // SSH 暴露是 input 链结构变更（非 set 元素）：必须整表原子重建。对账循环只增删 set 元素、
+    // 不重渲染链，故此变更落地后不会被它 revert（仅 list() 失败时的兜底重建会读 store 同步本值）。
+    st.backend
+        .apply(&st.cfg.ruleset_with(allowlist_only), &entries)
+        .map_err(|e| ApiError::new(ErrorCode::NftFailure, e.to_string()))?;
+    Ok(AgentSettings {
+        ssh_allowlist_only: allowlist_only,
+        ssh_port: st.cfg.ssh_port,
+    })
 }
 
 // ---- 端口转发（独立 `ip ipgate_nat` 表）----

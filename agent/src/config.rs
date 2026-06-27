@@ -80,9 +80,11 @@ impl AgentConfig {
         Ok(())
     }
 
-    pub fn ruleset(&self) -> RulesetConfig {
+    /// 构造 ruleset 配置；`ssh_allowlist_only` 是运行期可调状态（存在 store），由调用方注入。
+    pub fn ruleset_with(&self, ssh_allowlist_only: bool) -> RulesetConfig {
         RulesetConfig {
             ssh_port: self.ssh_port,
+            ssh_allowlist_only,
             public_tcp: self.public_tcp.clone(),
             public_udp: self.public_udp.clone(),
         }
@@ -102,7 +104,7 @@ mod tests {
         let c = AgentConfig::default();
         assert_eq!(c.mgmt_port, 19186);
         assert_eq!(c.ssh_port, 22);
-        assert_eq!(c.ruleset().ssh_port, 22);
+        assert_eq!(c.ruleset_with(false).ssh_port, 22);
         c.validate().unwrap();
     }
 

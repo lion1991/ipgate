@@ -190,6 +190,10 @@ fn dispatch(st: &AppState, device: DeviceId, peer_ip: IpAddr, req: RpcRequest) -
             handlers::revoke_device(st, id)?;
             Ok(serde_json::Value::Null)
         }
+        GetSettings => to_val(handlers::get_settings(st)),
+        SetSshExposure { allowlist_only } => {
+            to_val(handlers::set_ssh_exposure(st, allowlist_only)?)
+        }
     })();
     match out {
         Ok(v) => RpcResponse::Ok(v),

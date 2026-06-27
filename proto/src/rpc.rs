@@ -76,6 +76,19 @@ pub enum RpcRequest {
     ListDevices,
     /// `DELETE /v1/devices/{id}`
     RevokeDevice(DeviceId),
+    /// 读取 agent 设置（当前 SSH 暴露模式等）→ [`AgentSettings`]。
+    GetSettings,
+    /// 切换 SSH 端口暴露：true=仅放行名单，false=对所有人开放。返回 [`AgentSettings`]。
+    SetSshExposure { allowlist_only: bool },
+}
+
+/// agent 可由客户端查看/调节的运行期设置（ADR 0007）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSettings {
+    /// SSH 端口当前是否仅对放行名单开放（见 [`crate::RulesetConfig::ssh_allowlist_only`]）。
+    pub ssh_allowlist_only: bool,
+    /// 当前 SSH 管理端口（展示用，便于客户端文案标明是「端口 N」）。
+    pub ssh_port: u16,
 }
 
 /// 隧道内的 RPC 响应。成功负载按对应 op 的类型编码（客户端据 op 反序列化）；
