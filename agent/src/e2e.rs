@@ -301,6 +301,51 @@ async fn forward_crud_flow() {
 }
 
 #[tokio::test]
+async fn ssh_exposure_toggle_flow() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("x".into()) },
+    )
+    .await
+    .unwrap();
+
+    // 默认：对所有人开放。
+    let s: AgentSettings = cli.ok(RpcRequest::GetSettings).await;
+    assert!(!s.ssh_allowlist_only);
+    assert_eq!(s.ssh_port, 22);
+
+    // 名单为空时开启「仅名单」→ 被自锁防护拒绝。
+    match cli.rpc(RpcRequest::SetSshExposure { allowlist_only: true }).await {
+        RpcResponse::Err(e) => assert_eq!(e.code, ErrorCode::BadRequest),
+        RpcResponse::Ok(_) => panic!("名单为空应拒绝开启仅名单"),
+    }
+
+    // 放行一个 IP 后再开启 → 成功。
+    let _: Entry = cli
+        .ok(RpcRequest::Allow(AllowRequest {
+            target: "203.0.113.7/32".parse().unwrap(),
+            note: "me".into(),
+            expires_at: None,
+        }))
+        .await;
+    let s: AgentSettings = cli.ok(RpcRequest::SetSshExposure { allowlist_only: true }).await;
+    assert!(s.ssh_allowlist_only);
+
+    // 持久化生效：重读为开。
+    let s: AgentSettings = cli.ok(RpcRequest::GetSettings).await;
+    assert!(s.ssh_allowlist_only);
+
+    // 关回开放（任何时候都允许，不受名单约束）。
+    let s: AgentSettings = cli.ok(RpcRequest::SetSshExposure { allowlist_only: false }).await;
+    assert!(!s.ssh_allowlist_only);
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+#[tokio::test]
 async fn whoami_reports_peer_ip() {
     let srv = spawn().await;
     let (priv_, _) = gen_device();

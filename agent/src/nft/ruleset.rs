@@ -127,9 +127,17 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
     s.push_str(&format!(
         "        ip protocol icmp icmp type {{ {ICMP_INFRA_TYPES} }} accept\n"
     ));
-    // SSH 管理端口：无条件放行（ADR 0007 自锁不变量）——它是唯一入口，字面规则、不可被
-    // API 移除。Noise 服务仅 loopback，命中上面 `iif lo accept`，无需任何公网放行规则。
-    s.push_str(&format!("        tcp dport {} accept\n", cfg.ssh_port));
+    // SSH 管理端口（ADR 0007 唯一入口）。默认无条件放行（自锁不变量，最稳）；开启
+    // ssh_allowlist_only 后去掉这条——SSH 改由下方 `ip saddr @allow accept` 命中，即仅
+    // 名单内源 IP 可连（含管理隧道）。Noise 服务仅 loopback，命中上面 `iif lo accept`。
+    if cfg.ssh_allowlist_only {
+        s.push_str(&format!(
+            "        # ssh dport {} 仅名单可连（见末尾 saddr 规则）\n",
+            cfg.ssh_port
+        ));
+    } else {
+        s.push_str(&format!("        tcp dport {} accept\n", cfg.ssh_port));
+    }
     s.push_str(&format!("        tcp dport @{NFT_SET_PUBLIC_TCP} accept\n"));
     s.push_str(&format!("        udp dport @{NFT_SET_PUBLIC_UDP} accept\n"));
     s.push_str(&format!("        ip saddr @{NFT_SET_ALLOW4} accept\n"));
@@ -240,10 +248,31 @@ mod tests {
     fn public_ports_rendered_as_ranges() {
         let cfg = RulesetConfig {
             ssh_port: 22,
+            ssh_allowlist_only: false,
             public_tcp: vec![PortRange::single(443), PortRange { start: 8000, end: 8010 }],
             public_udp: vec![],
         };
         let s = render_apply(&cfg, &[], Utc::now());
         assert!(s.contains("set public_tcp { type inet_service; flags interval; elements = { 443, 8000-8010 } }"));
+    }
+
+    #[test]
+    fn ssh_allowlist_only_drops_unconditional_accept() {
+        // 默认（开放）：有字面 SSH 放行。
+        let open = render_apply(&RulesetConfig::default(), &[], Utc::now());
+        assert!(open.contains("tcp dport 22 accept"));
+
+        // 仅名单：去掉无条件放行，但 saddr 规则仍在（名单内源 IP 经它连 SSH）。
+        let restricted = RulesetConfig {
+            ssh_allowlist_only: true,
+            ..RulesetConfig::default()
+        };
+        let s = render_apply(&restricted, &[], Utc::now());
+        assert!(!s.contains("tcp dport 22 accept"));
+        assert!(s.contains("ip saddr @allow4 accept"));
+        assert!(s.contains("ip6 saddr @allow6 accept"));
+        // 仍保持 default-drop 与 loopback 不变量。
+        assert!(s.contains("policy drop;"));
+        assert!(s.contains("iif lo accept"));
     }
 }
