@@ -120,8 +120,9 @@ provision_tunnel_key() {
   akf="$home/.ssh/authorized_keys"
   mkdir -p "$home/.ssh"; chmod 700 "$home/.ssh"
   pub="$(cat "$key.pub")"
-  # 受限前缀：强制空命令 + restrict（关 pty/agent/x11/转发）+ 仅许转发到 loopback Noise 口。
-  entry="command=\"/bin/false\",restrict,permitopen=\"127.0.0.1:$np\" $pub"
+  # 受限前缀：强制空命令 + restrict（关 pty/agent/x11/exec）+ port-forwarding 重新开转发
+  # （restrict 会关掉转发，permitopen 只过滤不重开，必须显式补 port-forwarding）+ 仅许转发到 Noise 口。
+  entry="command=\"/bin/false\",restrict,port-forwarding,permitopen=\"127.0.0.1:$np\" $pub"
   touch "$akf"; chmod 600 "$akf"
   # 幂等：删旧 ipgate-tunnel 条目（公钥注释含 ipgate-tunnel）再写新（端口可能变）。
   grep -vF "ipgate-tunnel" "$akf" 2>/dev/null > "$akf.tmp" || true
