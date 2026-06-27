@@ -207,6 +207,13 @@ if [ -z "$BIN_SRC" ]; then
   fi
   if [ "$FORCE" != 1 ] && [ -n "$target" ] && [ "$installed" = "$target" ]; then
     log "已是最新版本 $installed —— 无更新，跳过。（--force 可强制重装）"
+    # 自愈：缺仅转发隧道 key 则补（ADR 0007；手动 swap / 早退路径漏生成时重跑也能补齐）。
+    if [ ! -f "$DATA_DIR/tunnel_key" ] && [ -f "$CONF_DIR/config.json" ]; then
+      mkdir -p "$DATA_DIR"; chmod 0700 "$DATA_DIR"
+      sh_np="$(grep -o '"mgmt_port"[^,]*' "$CONF_DIR/config.json" 2>/dev/null | grep -o '[0-9][0-9]*' | head -1 || true)"
+      sh_su="$(grep -o '"ssh_user"[^,]*' "$CONF_DIR/config.json" 2>/dev/null | sed 's/.*: *"//; s/".*//' || true)"
+      provision_tunnel_key "${sh_np:-19186}" "${sh_su:-root}"
+    fi
     # 确保服务在跑（升级判断为"无更新"也顺手把停掉的服务拉起来）。
     systemctl is-active --quiet ipgate-agent.service 2>/dev/null \
       || systemctl restart ipgate-agent.service 2>/dev/null || true
@@ -267,8 +274,9 @@ mkdir -p "$DATA_DIR"
 chmod 0700 "$DATA_DIR"
 
 # --- 生成仅转发 SSH 隧道密钥（ADR 0007）---
-np_cfg="$(grep -o '"mgmt_port"[^,]*' "$CONF_DIR/config.json" | grep -o '[0-9][0-9]*' | head -1)"
-suser_cfg="$(grep -o '"ssh_user"[^,]*' "$CONF_DIR/config.json" | sed 's/.*: *"//; s/".*//')"
+# `|| true`：老 config 可能没有 ssh_user，grep 无匹配返回 1，会被 set -euo pipefail 误当致命错而中止。
+np_cfg="$(grep -o '"mgmt_port"[^,]*' "$CONF_DIR/config.json" 2>/dev/null | grep -o '[0-9][0-9]*' | head -1 || true)"
+suser_cfg="$(grep -o '"ssh_user"[^,]*' "$CONF_DIR/config.json" 2>/dev/null | sed 's/.*: *"//; s/".*//' || true)"
 provision_tunnel_key "${np_cfg:-19186}" "${suser_cfg:-root}"
 
 # --- SSH 不会自锁（ADR 0007）---
