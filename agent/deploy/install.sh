@@ -103,6 +103,45 @@ collect_admin_ips() {
   } 2>/dev/null | grep -vE '^$|^:0' | sort -u
 }
 
+# 探测本机实际的 SSH 端口（有些主机改了非 22）。ruleset 无条件放行的就是 ssh_port——探错会在
+# default-drop 生效后把新 SSH 连接挡在外面。优先级：当前会话连入的服务端口（admin 正在用、最该
+# 放行）> sshd 生效配置 Port > ss/netstat 实际监听 > 兜底 22。多端口时取首选一个。
+detect_ssh_port() {
+  set +e +o pipefail
+  local p=""
+  # 1) 当前 SSH 会话连入的服务端口（$SSH_CONNECTION 末段）。sudo 会清掉环境 → root 再扫 /proc 找回。
+  [ -n "${SSH_CONNECTION:-}" ] && p="$(awk '{print $NF}' <<<"$SSH_CONNECTION")"
+  if [ -z "$p" ] && [ "$(id -u)" = 0 ]; then
+    p="$(cat /proc/*/environ 2>/dev/null | tr '\0' '\n' | sed -n 's/^SSH_CONNECTION=//p' | awk '{print $NF}' | head -1)"
+  fi
+  # 2) sshd 生效配置的 Port（权威）。
+  if [ -z "$p" ] && command -v sshd >/dev/null 2>&1; then
+    p="$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')"
+  fi
+  # 3) sshd 实际监听端口（ss / netstat 兜底；末段取端口，兼容 IPv6 [::]:N）。
+  if [ -z "$p" ] && command -v ss >/dev/null 2>&1; then
+    p="$(ss -H -tlnp 2>/dev/null | awk '/sshd/{n=split($4,a,":"); print a[n]; exit}')"
+  fi
+  if [ -z "$p" ] && command -v netstat >/dev/null 2>&1; then
+    p="$(netstat -tlnp 2>/dev/null | awk '/sshd/{n=split($4,a,":"); print a[n]; exit}')"
+  fi
+  case "$p" in ''|*[!0-9]*) p=22 ;; esac
+  { [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; } 2>/dev/null || p=22
+  set -e -o pipefail
+  printf '%s' "$p"
+}
+
+# 列出 sshd 所有监听端口（空格分隔），用于校验既有配置的 ssh_port 是否仍命中真实端口。
+ssh_ports_all() {
+  set +e +o pipefail
+  local out=""
+  command -v sshd >/dev/null 2>&1 && out="$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2}')"
+  [ -z "$out" ] && command -v ss >/dev/null 2>&1 \
+    && out="$(ss -H -tlnp 2>/dev/null | awk '/sshd/{n=split($4,a,":"); print a[n]}' | sort -u)"
+  set -e -o pipefail
+  printf '%s' "$(echo $out | tr '\n' ' ')"
+}
+
 # 生成「仅转发」SSH 隧道密钥（ADR 0007）。客户端经 SSH 隧道把本机 loopback 的 Noise 口转出去；
 # 这把 key 单把共享、强制 command=/bin/false + restrict + 仅 permitopen 到 Noise 口——即便泄露
 # 也只换来「到达 Noise 口」，仍须 Noise 设备鉴权才能下命令。私钥存 $DATA_DIR/tunnel_key，由
@@ -247,10 +286,22 @@ log "安装二进制 -> $PREFIX/ipgate-agent"
 install -m 0755 "$BIN_SRC" "$PREFIX/ipgate-agent"
 
 mkdir -p "$CONF_DIR"
+ssh_port_detected="$(detect_ssh_port)"
+config_fresh=0
 if [ -f "$CONF_DIR/config.json" ]; then
   log "保留已有配置 $CONF_DIR/config.json"
+  # 不动既有配置，但若其 ssh_port 已不在 sshd 实际监听端口里 → 提醒（default-drop 后 ruleset
+  # 只无条件放行 ssh_port，错了会把新 SSH 连接挡在外面，且管理隧道也走 SSH）。
+  cur_sp="$(grep -o '"ssh_port"[^,]*' "$CONF_DIR/config.json" 2>/dev/null | grep -o '[0-9][0-9]*' | head -1 || true)"
+  all_sp="$(ssh_ports_all)"
+  if [ -n "$cur_sp" ] && [ -n "$all_sp" ] && ! printf ' %s ' "$all_sp" | grep -q " $cur_sp "; then
+    warn "配置 ssh_port=$cur_sp，但 sshd 实际监听端口为: $all_sp。default-drop 后新 SSH 连接可能被挡在外！"
+    warn "建议改 $CONF_DIR/config.json 的 ssh_port 为其中之一再重启："
+    warn "  sed -i 's/\"ssh_port\"[^,]*/\"ssh_port\": ${ssh_port_detected}/' $CONF_DIR/config.json && systemctl restart ipgate-agent"
+  fi
 elif [ -f "$SCRIPT_DIR/config.example.json" ]; then
   install -m 0644 "$SCRIPT_DIR/config.example.json" "$CONF_DIR/config.json"
+  config_fresh=1
   log "写入默认配置 $CONF_DIR/config.json"
 else
   # 同目录没有模板（如 curl|bash 或只下了二进制）→ 内置默认，保持自包含。
@@ -268,7 +319,18 @@ else
 }
 JSON
   chmod 0644 "$CONF_DIR/config.json"
+  config_fresh=1
   log "未找到 config.example.json，已写入内置默认配置 $CONF_DIR/config.json"
+fi
+
+# 新建的配置：把 ssh_port 写成探测到的实际 SSH 端口（有些主机非 22；探错会在 default-drop 后锁死 SSH）。
+if [ "$config_fresh" = 1 ]; then
+  if [ -n "$ssh_port_detected" ] && [ "$ssh_port_detected" != 22 ]; then
+    sed -i 's/"ssh_port"[[:space:]]*:[[:space:]]*[0-9]*/"ssh_port": '"$ssh_port_detected"'/' "$CONF_DIR/config.json" \
+      && log "已将 ssh_port 设为探测到的实际 SSH 端口 $ssh_port_detected"
+  else
+    log "SSH 端口探测为 $ssh_port_detected（ruleset 据此无条件放行）"
+  fi
 fi
 
 mkdir -p "$DATA_DIR"
@@ -281,8 +343,10 @@ suser_cfg="$(grep -o '"ssh_user"[^,]*' "$CONF_DIR/config.json" 2>/dev/null | sed
 provision_tunnel_key "${np_cfg:-19186}" "${suser_cfg:-root}"
 
 # --- SSH 不会自锁（ADR 0007）---
-# ruleset 无条件放行 ssh_port（默认 22），故 default-drop 生效后 SSH 仍可从任意 IP 连入
+# ruleset 无条件放行 ssh_port，故 default-drop 生效后 SSH 仍可从任意 IP 连入
 # （由 SSH 自身密钥鉴权保护）。下面把识别到的管理 IP 也加进名单仅作额外便利（访问其他服务）。
+eff_ssh_port="$(grep -o '"ssh_port"[^,]*' "$CONF_DIR/config.json" 2>/dev/null | grep -o '[0-9][0-9]*' | head -1 || true)"
+[ -n "$eff_ssh_port" ] || eff_ssh_port=22
 admin_ips="$(collect_admin_ips)"
 if [ -n "$admin_ips" ]; then
   while IFS= read -r aip; do
@@ -292,7 +356,7 @@ if [ -n "$admin_ips" ]; then
       && log "已额外放行管理来源 $c" || warn "跳过无法识别的来源: $aip"
   done <<<"$admin_ips"
 fi
-warn "SSH（ssh_port，默认 22）已由 ruleset 无条件放行，default-drop 不会锁死 SSH。"
+warn "SSH 端口 $eff_ssh_port 已由 ruleset 无条件放行，default-drop 不会锁死 SSH。"
 warn "若本机对外提供 Web 等服务，务必把 80/443 写进 config.json 的 public_tcp！"
 
 # --- 安装 systemd unit ---
