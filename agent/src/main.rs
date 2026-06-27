@@ -57,7 +57,17 @@ enum Cmd {
         interval: u64,
     },
     /// 生成一次性配对码（供新设备入网），并打印服务端指纹。
-    Pair,
+    Pair {
+        /// 额外渲染配对二维码（移动端「扫码配对」一步入网，含指纹 + 口令）。
+        #[arg(long)]
+        qr: bool,
+        /// 写进二维码的主机地址（域名或 IP，客户端用它连接）。`--qr` 时必填。
+        #[arg(long)]
+        host: Option<String>,
+        /// 写进二维码的端口；缺省取 config 的 mgmt_port。
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// 离线放行一个 IP/CIDR（写存储；服务未运行时用，如安装时防自锁）。
     Allow {
         /// 目标 IP 或 CIDR，如 203.0.113.7/32。
@@ -144,7 +154,7 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Run { interval } => run(cfg, interval)?,
-        Cmd::Pair => pair(&cfg)?,
+        Cmd::Pair { qr, host, port } => pair(&cfg, qr, host, port)?,
         Cmd::Allow {
             target,
             note,
@@ -196,24 +206,64 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn pair(cfg: &AgentConfig) -> Result<()> {
+fn pair(cfg: &AgentConfig, qr: bool, host: Option<String>, port: Option<u16>) -> Result<()> {
     let identity = tls::load_or_generate(&cfg.data_dir)?;
     let code = auth::pairing::create(&cfg.data_dir, PAIRING_CODE_TTL_SECS, Utc::now())?;
     let ttl_min = PAIRING_CODE_TTL_SECS / 60;
     println!("服务端指纹（逐位核对）：{}", identity.fingerprint);
-    if cfg.require_access_key {
-        // join 串 = 访问密钥.配对码；客户端粘一次、自动拆分，之后每次请求都带访问密钥。
+    // join 串 = 访问密钥.配对码（启用密钥门时）；否则就是配对码本身。客户端粘一次自动拆分。
+    let join = if cfg.require_access_key {
         let access = auth::access::load_or_generate(&cfg.data_dir)?;
         println!(
             "配对口令（{ttl_min} 分钟内有效、单次，粘贴到客户端「配对码」栏）：\n  {}.{}",
             access,
             code.as_str()
         );
+        format!("{}.{}", access, code.as_str())
     } else {
         println!("配对码（{ttl_min} 分钟内有效、单次）：{}", code.as_str());
         println!("（提示：管理端口访问密钥门未开 require_access_key=false；建议开启以让端口对外「变暗」）");
+        code.as_str().to_string()
+    };
+
+    if qr {
+        let host = host.context("--qr 需配合 --host <地址>（写进二维码、供客户端连接）")?;
+        let port = port.unwrap_or(cfg.mgmt_port);
+        print_pair_qr(&host, port, &identity.fingerprint.to_string(), &join)?;
+    } else {
+        println!("在客户端输入主机地址 + 上面的口令，并核对指纹。");
     }
-    println!("在客户端输入主机地址 + 上面的口令，并核对指纹。");
+    Ok(())
+}
+
+/// 把配对信息编码成 `ipgate://pair#<base64url(json)>` 并在终端渲染二维码。
+///
+/// payload = `{v,h,p,fp,c}`：版本 / 主机 / 端口 / 指纹（冒号大写）/ join 串。客户端「扫码配对」
+/// 解析后直接 pin `fp`——指纹经二维码（agent 自己屏幕这条可信通道）传达，取代肉眼逐位核对。
+/// 二维码含单次配对码，与上面终端明文打印的 join 串同等敏感（单次 + TTL 失效即作废）。
+fn print_pair_qr(host: &str, port: u16, fingerprint: &str, join: &str) -> Result<()> {
+    use base64::Engine;
+    use qrcode::{render::unicode, EcLevel, QrCode};
+
+    let payload = serde_json::json!({
+        "v": 1,
+        "h": host,
+        "p": port,
+        "fp": fingerprint,
+        "c": join,
+    });
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?);
+    let uri = format!("ipgate://pair#{b64}");
+
+    // EcLevel::L：内容是单次短时口令、又显示在可信屏幕上，用最低纠错换更小（更易扫）的码。
+    let code = QrCode::with_error_correction_level(uri.as_bytes(), EcLevel::L)
+        .context("生成配对二维码失败")?;
+    let img = code
+        .render::<unicode::Dense1x2>()
+        .quiet_zone(true)
+        .build();
+    println!("\n用 ipgate 客户端「扫码配对」扫下面的二维码（含指纹 + 口令，单次有效）：\n{img}");
+    println!("（扫不动可手填：地址 {host}:{port}，口令见上）");
     Ok(())
 }
 
