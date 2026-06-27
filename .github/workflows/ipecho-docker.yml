@@ -1,0 +1,61 @@
+name: ipecho-docker
+
+# 构建 ipecho 容器镜像并推到 GitHub Container Registry (GHCR)。
+# - push 到 main 且改动了 ipecho/ → 滚动更新 latest + main + sha 标签
+# - 打 ipecho-vX.Y.Z tag → 额外推语义化版本标签
+# - 也可在 Actions 页手动触发(tag 构建若被 paths 过滤跳过时的兜底)
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ipecho/**'
+      - '.github/workflows/ipecho-docker.yml'
+    tags:
+      - 'ipecho-v*'
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/ipecho
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write          # 推 GHCR 需要;用内置 GITHUB_TOKEN,无需额外 secret
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=sha,format=short
+            type=match,pattern=ipecho-v(\d+\.\d+\.\d+),group=1
+            type=match,pattern=ipecho-v(\d+\.\d+),group=1
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./ipecho
+          file: ./ipecho/Dockerfile
+          platforms: linux/amd64          # 只构 amd64;要加 arm64 在此追加 ,linux/arm64 即可
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
