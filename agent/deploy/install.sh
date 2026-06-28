@@ -381,7 +381,9 @@ RestartSec=2
 TimeoutStartSec=30
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/ipgate
+# /etc 可写：开关 SSH 密码登录改 /etc/ssh/sshd_config；重置 root 密码 chpasswd 写 /etc/shadow
+# 并在 /etc 下建锁/临时/备份文件。缺它 ProtectSystem=strict 会让服务里这些写操作报「只读」。
+ReadWritePaths=/var/lib/ipgate /etc
 ProtectHome=yes
 PrivateTmp=yes
 ProtectControlGroups=yes
