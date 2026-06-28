@@ -119,7 +119,9 @@ pub fn set_password_auth(enabled: bool) -> Result<()> {
 
     // 幂等：先删旧受管块，再把新块插到最顶部（首个取值必胜）。
     let new_main = format!("{}{}", managed_block(enabled), strip_managed_block(&prev_main));
-    write_atomic(SSHD_CONFIG, &new_main).with_context(|| format!("写入 {SSHD_CONFIG} 失败"))?;
+    write_atomic(SSHD_CONFIG, &new_main).with_context(|| {
+        format!("写入 {SSHD_CONFIG} 失败（可读不可写：常见于文件被设了不可变属性 `chattr +i`，或 /etc 为只读挂载）")
+    })?;
     // 顺手清掉 0.2.3 的旧 drop-in，避免两处来源混淆（主配置受管块已是权威）。
     let _ = std::fs::remove_file(DROPIN_PATH);
 
