@@ -89,6 +89,17 @@ pub struct AgentSettings {
     pub ssh_allowlist_only: bool,
     /// 当前 SSH 管理端口（展示用，便于客户端文案标明是「端口 N」）。
     pub ssh_port: u16,
+    /// 系统 sshd 是否开着密码登录（best-effort 读 `sshd -T`）。
+    /// `None` = agent 探测不到（无 root/无 sshd）或旧版 agent 未上报（`serde(default)`）。
+    #[serde(default)]
+    pub ssh_password_auth: Option<bool>,
+    /// `KbdInteractive`（旧 `ChallengeResponse`）认证是否开着——开着 + PAM 可变相密码登录，
+    /// 故与 `ssh_password_auth` 一并构成「密码登录面」。`None` 同上。
+    #[serde(default)]
+    pub ssh_kbd_interactive_auth: Option<bool>,
+    /// `PermitRootLogin` 原值（展示用：yes / no / prohibit-password / forced-commands-only）。`None` 同上。
+    #[serde(default)]
+    pub ssh_permit_root_login: Option<String>,
 }
 
 /// 隧道内的 RPC 响应。成功负载按对应 op 的类型编码（客户端据 op 反序列化）；
