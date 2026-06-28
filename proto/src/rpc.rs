@@ -80,6 +80,11 @@ pub enum RpcRequest {
     GetSettings,
     /// 切换 SSH 端口暴露：true=仅放行名单，false=对所有人开放。返回 [`AgentSettings`]。
     SetSshExposure { allowlist_only: bool },
+    /// 开/关系统 sshd 的密码登录（写 sshd_config drop-in → 校验 → reload）。返回 [`AgentSettings`]。
+    /// `enabled=false`（关闭）是加固方向；`enabled=true`（开启）会扩大爆破面，客户端须强确认。
+    SetSshPasswordAuth { enabled: bool },
+    /// 重置 root 用户密码（chpasswd，明文经 Noise 隧道传输、走 stdin 不进 argv/日志）。无返回值。
+    ResetRootPassword { password: String },
 }
 
 /// agent 可由客户端查看/调节的运行期设置（ADR 0007）。

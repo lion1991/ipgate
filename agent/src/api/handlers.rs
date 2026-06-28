@@ -132,6 +132,24 @@ pub fn set_ssh_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<AgentS
     Ok(build_settings(st, allowlist_only))
 }
 
+/// 开/关系统 sshd 的密码登录（写 drop-in + reload），返回刷新后的设置。
+pub fn set_ssh_password_auth(st: &AppState, enabled: bool) -> ApiResult<AgentSettings> {
+    crate::sshd::set_password_auth(enabled)
+        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+    let allowlist_only = st.store.lock().unwrap().ssh_allowlist_only();
+    Ok(build_settings(st, allowlist_only))
+}
+
+/// 重置 root 密码。明文经 Noise 隧道送达，此处不落盘、不记日志，直接交 chpasswd。
+pub fn reset_root_password(password: String) -> ApiResult<()> {
+    if password.chars().count() < 8 {
+        return Err(ApiError::new(ErrorCode::BadRequest, "密码至少 8 位"));
+    }
+    crate::sshd::reset_root_password(&password)
+        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+    Ok(())
+}
+
 // ---- 端口转发（独立 `ip ipgate_nat` 表）----
 
 /// 构造单条转发的客户端视图：附上当前解析 IP 与是否生效。

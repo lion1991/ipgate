@@ -6,7 +6,12 @@
 //! 局限：`sshd -T`（不带 `-C`）取的是**全局生效值**，`Match` 块里针对特定用户/来源放开的
 //! 密码登录探测不到；任何环节拿不到（无 root / 无 sshd 二进制 / 调用失败）时各项为 `None`。
 
+use anyhow::{bail, Context, Result};
 use std::process::Command;
+
+/// ipgate 托管的 sshd drop-in 路径。文件名以 `00-` 开头，确保在 `Include` 的字典序里**排最前**，
+/// 压过 `50-cloud-init.conf` 之类默认打开密码登录的 drop-in（sshd 对每个关键字取**首个**取值）。
+const DROPIN_PATH: &str = "/etc/ssh/sshd_config.d/00-ipgate-ssh.conf";
 
 /// sshd 的认证相关生效配置（各项 `None` = 探测不到）。
 #[derive(Debug, Clone, Default)]
@@ -65,6 +70,125 @@ fn parse(text: &str) -> SshAuth {
     a
 }
 
+/// 渲染 ipgate sshd drop-in 内容（纯函数，可测）。
+/// 关闭时连 `KbdInteractive` 一并设为 no——它 + PAM 可变相做密码登录，要关就关干净。
+fn dropin_content(password_enabled: bool) -> String {
+    let head = "# Managed by ipgate-agent —— 勿手改，客户端会覆盖本文件。\n";
+    if password_enabled {
+        format!("{head}PasswordAuthentication yes\n")
+    } else {
+        format!("{head}PasswordAuthentication no\nKbdInteractiveAuthentication no\n")
+    }
+}
+
+/// 开/关 SSH 密码登录：写 drop-in → `sshd -t` 校验 → reload → 复查生效。任一步失败均回滚。
+///
+/// reload 用 SIGHUP，不断现有连接（客户端的隧道是已建立连接，安然无恙）；只对新连接生效。
+pub fn set_password_auth(enabled: bool) -> Result<()> {
+    // 备份旧 drop-in 以便回滚（None = 原本不存在）。
+    let prev = std::fs::read(DROPIN_PATH).ok();
+
+    write_dropin(&dropin_content(enabled)).with_context(|| format!("写入 {DROPIN_PATH} 失败"))?;
+
+    // sshd -t 校验：配置非法绝不 reload（带病 reload 可能让 sshd 起不来＝自锁）。
+    if let Err(e) = validate_sshd_config() {
+        restore_dropin(prev.as_deref());
+        return Err(e.context("sshd 配置校验失败，已回滚 drop-in"));
+    }
+    if let Err(e) = reload_sshd() {
+        restore_dropin(prev.as_deref());
+        return Err(e.context("reload sshd 失败，已回滚 drop-in"));
+    }
+    // 复查：drop-in 理应排最前生效；若没生效，多半是 sshd_config 在更靠前处显式写死了该项。
+    let got = probe().password;
+    if got != Some(enabled) {
+        restore_dropin(prev.as_deref());
+        let _ = reload_sshd();
+        bail!(
+            "drop-in 已写入但未生效（当前 PasswordAuthentication={got:?}）——\
+             sshd_config 可能在更靠前处显式设置了该项，需手动处理。已回滚。"
+        );
+    }
+    Ok(())
+}
+
+/// 重置 root 密码：`chpasswd` 走 stdin（不进 argv/ps/日志）。明文由调用方经 Noise 隧道送达。
+pub fn reset_root_password(password: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+    if password.is_empty() {
+        bail!("密码为空");
+    }
+    let mut child = Command::new("chpasswd")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("启动 chpasswd 失败")?;
+    {
+        let mut stdin = child.stdin.take().context("chpasswd stdin 不可用")?;
+        // chpasswd 读 `user:password` 行；密文由其按系统默认算法哈希。
+        writeln!(stdin, "root:{password}").context("写 chpasswd stdin 失败")?;
+    } // stdin 在此 drop → EOF
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!("chpasswd 失败：{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+fn write_dropin(content: &str) -> Result<()> {
+    let path = std::path::Path::new(DROPIN_PATH);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("conf.tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn restore_dropin(prev: Option<&[u8]>) {
+    match prev {
+        Some(bytes) => {
+            let _ = std::fs::write(DROPIN_PATH, bytes);
+        }
+        None => {
+            let _ = std::fs::remove_file(DROPIN_PATH);
+        }
+    }
+}
+
+/// `sshd -t`：校验当前生效配置是否能起。失败返回其 stderr。
+fn validate_sshd_config() -> Result<()> {
+    for bin in ["sshd", "/usr/sbin/sshd", "/usr/bin/sshd", "/sbin/sshd"] {
+        if let Ok(out) = Command::new(bin).arg("-t").output() {
+            if out.status.success() {
+                return Ok(());
+            }
+            bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+    }
+    bail!("找不到 sshd 可执行文件")
+}
+
+/// reload（SIGHUP，不断连接）优先；服务名 Debian=ssh / RHEL=sshd，都试；最后退化为 restart。
+fn reload_sshd() -> Result<()> {
+    for (action, svc) in [
+        ("reload", "ssh"),
+        ("reload", "sshd"),
+        ("restart", "ssh"),
+        ("restart", "sshd"),
+    ] {
+        if let Ok(out) = Command::new("systemctl").arg(action).arg(svc).output() {
+            if out.status.success() {
+                return Ok(());
+            }
+        }
+    }
+    bail!("systemctl reload/restart ssh|sshd 均失败")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +216,17 @@ mod tests {
         // 两个键都在时（理论上不会），以 kbdinteractive 为准。
         let t = "kbdinteractiveauthentication no\nchallengeresponseauthentication yes\n";
         assert_eq!(parse(t).kbd_interactive, Some(false));
+    }
+
+    #[test]
+    fn dropin_renders_both_directions() {
+        let on = dropin_content(true);
+        assert!(on.contains("PasswordAuthentication yes"));
+        assert!(!on.contains(" no"));
+        let off = dropin_content(false);
+        assert!(off.contains("PasswordAuthentication no"));
+        assert!(off.contains("KbdInteractiveAuthentication no")); // 关就关干净
+        assert!(off.starts_with("# Managed by ipgate-agent"));
     }
 
     #[test]
