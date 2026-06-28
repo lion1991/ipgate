@@ -132,10 +132,11 @@ pub fn set_ssh_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<AgentS
     Ok(build_settings(st, allowlist_only))
 }
 
-/// 开/关系统 sshd 的密码登录（写 drop-in + reload），返回刷新后的设置。
+/// 开/关系统 sshd 的密码登录（改 sshd_config + reload），返回刷新后的设置。
+/// `{e:#}` 带出完整 anyhow 因果链（含底层 io 错误，如 “Operation not permitted”），便于排障。
 pub fn set_ssh_password_auth(st: &AppState, enabled: bool) -> ApiResult<AgentSettings> {
     crate::sshd::set_password_auth(enabled)
-        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("{e:#}")))?;
     let allowlist_only = st.store.lock().unwrap().ssh_allowlist_only();
     Ok(build_settings(st, allowlist_only))
 }
@@ -146,7 +147,7 @@ pub fn reset_root_password(password: String) -> ApiResult<()> {
         return Err(ApiError::new(ErrorCode::BadRequest, "密码至少 8 位"));
     }
     crate::sshd::reset_root_password(&password)
-        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("{e:#}")))?;
     Ok(())
 }
 
