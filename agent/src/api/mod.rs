@@ -194,6 +194,11 @@ fn dispatch(st: &AppState, device: DeviceId, peer_ip: IpAddr, req: RpcRequest) -
         SetSshExposure { allowlist_only } => {
             to_val(handlers::set_ssh_exposure(st, allowlist_only)?)
         }
+        SetSshPasswordAuth { enabled } => to_val(handlers::set_ssh_password_auth(st, enabled)?),
+        ResetRootPassword { password } => {
+            handlers::reset_root_password(password)?;
+            Ok(serde_json::Value::Null)
+        }
     })();
     match out {
         Ok(v) => RpcResponse::Ok(v),
