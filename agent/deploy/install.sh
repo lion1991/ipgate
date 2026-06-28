@@ -87,6 +87,48 @@ resolve_latest_tag() {
   fi
 }
 
+# 写入/刷新 systemd unit（同目录有 .service 用之，否则内置一份）+ daemon-reload。
+# 单独成函数：全新装/升级/「二进制无更新」三条路径都要调它，确保 deploy-only 的 unit 改动
+# （如 ReadWritePaths）即便二进制同版本也能落地——否则会被「无更新跳过」永久漏掉。
+install_unit() {
+  log "安装 systemd unit"
+  if [ -f "$SCRIPT_DIR/ipgate-agent.service" ]; then
+    install -m 0644 "$SCRIPT_DIR/ipgate-agent.service" "$UNIT_DST"
+  else
+    cat > "$UNIT_DST" <<'UNIT'
+[Unit]
+Description=ipgate agent — nftables 放行名单管理（default-drop）
+Documentation=https://github.com/lion1991/ipgate
+Wants=network-pre.target
+Before=network-pre.target
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ipgate-agent --config /etc/ipgate/config.json run
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=30
+NoNewPrivileges=yes
+ProtectSystem=strict
+# /etc 可写：开关 SSH 密码登录改 /etc/ssh/sshd_config；重置 root 密码 chpasswd 写 /etc/shadow
+# 并在 /etc 下建锁/临时/备份文件。缺它 ProtectSystem=strict 会让服务里这些写操作报「只读」。
+ReadWritePaths=/var/lib/ipgate /etc
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    chmod 0644 "$UNIT_DST"
+    log "未找到 ipgate-agent.service，已写入内置 unit"
+  fi
+  systemctl daemon-reload
+}
+
 # 收集需放行的管理来源 IP（防自锁）。sudo 会清掉 SSH_CONNECTION/SSH_CLIENT，
 # 故 root 时再扫进程环境找回；叠加 who 与 --allow。去重、剔除空与本地显示 :0。
 collect_admin_ips() {
@@ -254,9 +296,11 @@ if [ -z "$BIN_SRC" ]; then
       sh_su="$(grep -o '"ssh_user"[^,]*' "$CONF_DIR/config.json" 2>/dev/null | sed 's/.*: *"//; s/".*//' || true)"
       provision_tunnel_key "${sh_np:-19186}" "${sh_su:-root}"
     fi
-    # 确保服务在跑（升级判断为"无更新"也顺手把停掉的服务拉起来）。
-    systemctl is-active --quiet ipgate-agent.service 2>/dev/null \
-      || systemctl restart ipgate-agent.service 2>/dev/null || true
+    # 二进制无更新 ≠ 不刷新部署：unit 可能有 deploy-only 改动（如 ReadWritePaths），仍重写并
+    # 重启使其生效（daemon-reload 不会重启已在跑的实例，故必须 restart 而非仅 is-active 兜底）。
+    install_unit
+    systemctl enable ipgate-agent.service >/dev/null 2>&1 || true
+    systemctl restart ipgate-agent.service 2>/dev/null || true
     exit 0
   fi
   if [ -n "$installed" ]; then
@@ -360,43 +404,7 @@ warn "SSH 端口 $eff_ssh_port 已由 ruleset 无条件放行，default-drop 不
 warn "若本机对外提供 Web 等服务，务必把 80/443 写进 config.json 的 public_tcp！"
 
 # --- 安装 systemd unit ---
-log "安装 systemd unit"
-if [ -f "$SCRIPT_DIR/ipgate-agent.service" ]; then
-  install -m 0644 "$SCRIPT_DIR/ipgate-agent.service" "$UNIT_DST"
-else
-  # 同目录没有 unit 文件 → 内置一份，保持自包含。
-  cat > "$UNIT_DST" <<'UNIT'
-[Unit]
-Description=ipgate agent — nftables 放行名单管理（default-drop）
-Documentation=https://github.com/lion1991/ipgate
-Wants=network-pre.target
-Before=network-pre.target
-After=local-fs.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/ipgate-agent --config /etc/ipgate/config.json run
-Restart=on-failure
-RestartSec=2
-TimeoutStartSec=30
-NoNewPrivileges=yes
-ProtectSystem=strict
-# /etc 可写：开关 SSH 密码登录改 /etc/ssh/sshd_config；重置 root 密码 chpasswd 写 /etc/shadow
-# 并在 /etc 下建锁/临时/备份文件。缺它 ProtectSystem=strict 会让服务里这些写操作报「只读」。
-ReadWritePaths=/var/lib/ipgate /etc
-ProtectHome=yes
-PrivateTmp=yes
-ProtectControlGroups=yes
-ProtectKernelLogs=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-  chmod 0644 "$UNIT_DST"
-  log "未找到 ipgate-agent.service，已写入内置 unit"
-fi
-systemctl daemon-reload
+install_unit
 systemctl enable ipgate-agent.service >/dev/null 2>&1 || true
 # 用 restart 而非 enable --now：无论之前是否在跑，都拉起新二进制 —— 重复运行脚本 = 原地升级。
 systemctl restart ipgate-agent.service
