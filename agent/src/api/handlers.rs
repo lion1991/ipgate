@@ -84,11 +84,22 @@ pub fn sync(st: &AppState) -> ApiResult<Diff> {
 
 // ---- agent 设置（SSH 端口暴露模式）----
 
-pub fn get_settings(st: &AppState) -> AgentSettings {
+/// 组装 [`AgentSettings`]：运行期 SSH 暴露态 + 静态端口 + best-effort 的 sshd 认证态势。
+/// `sshd -T` 探测失败（无 root/无 sshd）时各认证项为 `None`，不影响其余字段。
+fn build_settings(st: &AppState, ssh_allowlist_only: bool) -> AgentSettings {
+    let auth = crate::sshd::probe();
     AgentSettings {
-        ssh_allowlist_only: st.store.lock().unwrap().ssh_allowlist_only(),
+        ssh_allowlist_only,
         ssh_port: st.cfg.ssh_port,
+        ssh_password_auth: auth.password,
+        ssh_kbd_interactive_auth: auth.kbd_interactive,
+        ssh_permit_root_login: auth.permit_root,
     }
+}
+
+pub fn get_settings(st: &AppState) -> AgentSettings {
+    let allowlist_only = st.store.lock().unwrap().ssh_allowlist_only();
+    build_settings(st, allowlist_only)
 }
 
 /// 切换 SSH 端口暴露模式并整表重建 ruleset。
@@ -118,10 +129,7 @@ pub fn set_ssh_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<AgentS
     st.backend
         .apply(&st.cfg.ruleset_with(allowlist_only), &entries)
         .map_err(|e| ApiError::new(ErrorCode::NftFailure, e.to_string()))?;
-    Ok(AgentSettings {
-        ssh_allowlist_only: allowlist_only,
-        ssh_port: st.cfg.ssh_port,
-    })
+    Ok(build_settings(st, allowlist_only))
 }
 
 // ---- 端口转发（独立 `ip ipgate_nat` 表）----

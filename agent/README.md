@@ -84,7 +84,7 @@ RPC op（握手后，隧道内 JSON）：
   remove_dnat / migrate_dnat                dnat 适配（ADR 0006）
   list_interfaces                           列主机网卡（客户端下拉用）
   list_devices / revoke_device              已授权设备 / 吊销
-  get_settings / set_ssh_exposure           读取设置 / 切换 SSH 端口暴露（仅名单↔对所有人）
+  get_settings / set_ssh_exposure           读取设置（SSH 暴露模式 + 端口 + sshd 密码登录态势）/ 切换 SSH 端口暴露（仅名单↔对所有人）
   whoami                                    回报对端 IP（注：SSH 隧道下为 loopback）
 ```
 
@@ -95,7 +95,7 @@ RPC op（握手后，隧道内 JSON）：
 ## 开发
 
 ```sh
-cargo test                  # 69 项：Noise 握手/配对 + 放行→撤销 + 端口转发 CRUD + SSH 暴露切换 端到端（真 TCP+Noise）+ ruleset/nat 渲染 + 隧道密钥种子抽取
+cargo test                  # 73 项：Noise 握手/配对 + 放行→撤销 + 端口转发 CRUD + SSH 暴露切换 端到端（真 TCP+Noise）+ ruleset/nat 渲染 + 隧道密钥种子抽取 + sshd 认证态势解析
 cargo clippy --all-targets
 cargo run -- --config <cfg> print-ruleset   # 非 Linux 可跑（纯渲染）
 cargo run -- --config <cfg> pair            # 非 Linux 可跑（生成 Noise 密钥 + 配对码）

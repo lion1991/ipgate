@@ -13,6 +13,7 @@ mod nft;
 mod noise;
 mod reconcile;
 mod resolve;
+mod sshd;
 mod store;
 mod util;
 
