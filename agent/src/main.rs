@@ -35,7 +35,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use store::Store;
+use store::{LockExt, Store};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -462,6 +462,18 @@ fn forward_add_cli(
     if req.dest_host.is_empty() {
         anyhow::bail!("目标主机为空");
     }
+    // 安全闸：与 HTTP add_forward 对齐（评审：CLI 此前漏了入参校验，落地期 resolve_one 仍兜
+    // 底跳过，但此处即时报错体验更好）。网卡名防 nft 注入；字面量目标挡环回/元数据等禁区。
+    if let Some(i) = &req.iface {
+        if !ipgate_proto::valid_iface_name(i) {
+            anyhow::bail!("网卡名非法（仅允许字母数字与 . _ -，≤15 字符）");
+        }
+    }
+    if let Ok(ip) = req.dest_host.parse::<std::net::Ipv4Addr>() {
+        if let Some(why) = ipgate_proto::forbidden_forward_target(ip) {
+            anyhow::bail!("目标地址不允许：{why}");
+        }
+    }
 
     // 碰撞检测：与 HTTP add_forward 对齐（评审：CLI 此前漏了这道闸，破坏「同端口不双权威」不变量）。
     let adapter = dnat::DnatAdapter::new(cfg.dnat.clone());
@@ -479,7 +491,7 @@ fn forward_add_cli(
 
     let store = Arc::new(Mutex::new(Store::load(&cfg.store_path())?));
     let rule = {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock_safe();
         let r = s.add_forward(req, DeviceId(Uuid::nil()), Utc::now());
         s.save()?;
         r
@@ -509,7 +521,7 @@ fn forward_rm_cli(cfg: &AgentConfig, id: &str) -> Result<()> {
     let id = ForwardId(Uuid::parse_str(id.trim()).context("非法 id（应为 uuid）")?);
     let store = Arc::new(Mutex::new(Store::load(&cfg.store_path())?));
     let removed = {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock_safe();
         let r = s.remove_forward(id);
         if r {
             s.save()?;
@@ -589,7 +601,7 @@ fn dnat_migrate_cli(cfg: &AgentConfig, listen: &str, iface: &str) -> Result<()> 
         .map_err(|e| anyhow::anyhow!("该 dnat 规则的端口映射 native 不支持，无法迁移：{e}"))?;
     let store = Arc::new(Mutex::new(Store::load(&cfg.store_path())?));
     {
-        let s = store.lock().unwrap();
+        let s = store.lock_safe();
         if s.forwards().iter().any(|f| {
             f.iface.clone().or_else(netinfo::default_route_iface).as_deref() == Some(rule.iface.as_str())
                 && f.listen.overlaps(&rule.listen)
@@ -600,7 +612,7 @@ fn dnat_migrate_cli(cfg: &AgentConfig, listen: &str, iface: &str) -> Result<()> 
 
     // 先建 native（-90，dnat -100 仍赢→零抖动）→ 落地 → 核实生效 → 再删 dnat（零瞬断）。
     let new_rule = {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock_safe();
         let r = s.add_forward(req, DeviceId(Uuid::nil()), Utc::now());
         s.save()?;
         r
@@ -608,9 +620,9 @@ fn dnat_migrate_cli(cfg: &AgentConfig, listen: &str, iface: &str) -> Result<()> 
     let nat: Arc<dyn NatBackend + Send + Sync> = Arc::new(NftCli::new());
     forward::apply_now(&store, &nat).context("native 落地失败（已写存储，未撤 dnat）")?;
     // native 未解析生效则回滚僵尸规则、保留 dnat（评审：避免在 native 没生效时撤 dnat 致转发全黑）。
-    if store.lock().unwrap().resolved_ip(new_rule.id).is_none() {
+    if store.lock_safe().resolved_ip(new_rule.id).is_none() {
         {
-            let mut s = store.lock().unwrap();
+            let mut s = store.lock_safe();
             s.remove_forward(new_rule.id);
             let _ = s.save();
         }
@@ -644,7 +656,7 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
 
     // 启动即清过期 + 全量原子重建（坐实 default-drop 与管理端口放行不变量）。
     {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock_safe();
         if !s.prune_expired(Utc::now()).is_empty() {
             s.save()?;
         }
@@ -712,7 +724,7 @@ fn reconcile_loop(
         std::thread::sleep(Duration::from_secs(interval));
         let now = Utc::now();
         let (entries, ssh_allowlist_only) = {
-            let mut s = store.lock().unwrap();
+            let mut s = store.lock_safe();
             if !s.prune_expired(now).is_empty() {
                 let _ = s.save();
             }

@@ -82,6 +82,61 @@ impl ForwardRule {
     }
 }
 
+/// 合法网卡名：非空、≤15 字符（Linux `IFNAMSIZ`-1）、仅 `[A-Za-z0-9._-]`。
+///
+/// 安全用途：`iface` 会被原样插进 `nft -f` 文本脚本的 `iifname "{iface}"`（agent
+/// `nft::nat`，ADR 0005）。若不限制字符集，含 `"`/换行/`;`/`{` 的值可闭合字符串、
+/// 追加任意 nftables 语句（如 `flush table inet ipgate`，冲掉放行不变量）。本白名单
+/// 不含任何这类元字符，从源头堵死注入。点号保留是为 VLAN 子接口（如 `eth0.100`）。
+pub fn valid_iface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// 已知**不在** 169.254/16 链路本地段内的云元数据端点：阿里云 ECS 的元数据服务在
+/// `100.100.100.200`（明文 HTTP，可取 RAM/STS 临时凭证；`100.100.100.136` 为同族端点），
+/// 它们落在 `100.64/10` CGNAT 段内。该段整体须放行（Tailscale 等合法远端也用 100.64/10），
+/// 故按**精确 IP** 拦这两个端点，而非拦整段。其余主流云（AWS/GCP/Azure/腾讯/华为）的元
+/// 数据走 `169.254.169.254`，已由链路本地分支覆盖。
+const CLOUD_METADATA_IPS: [Ipv4Addr; 2] = [
+    Ipv4Addr::new(100, 100, 100, 200),
+    Ipv4Addr::new(100, 100, 100, 136),
+];
+
+/// 转发目标 IPv4 是否落在「绝不允许 DNAT 过去」的禁区；`Some(原因)` 即拒绝。
+///
+/// 安全用途（ADR 0007 的「零开放端口 / 仅 loopback」不变量）：
+/// - **云元数据端点**：`169.254.169.254`（链路本地分支）与阿里云 `100.100.100.200`
+///   （[`CLOUD_METADATA_IPS`]）——重新发布到公网即等于把 RAM/STS/IAM 凭证泄露给外网。
+/// - **环回 127/8**：会把 agent 自身 loopback-only 的管理面、或本机其它本地服务
+///   重新发布到公网（再叠加 DNS 重绑定，纯网络攻击者可直达 Noise 端口）。
+/// - **链路本地 169.254/16**：含上面的通用元数据地址。
+/// - **0.0.0.0/8 / 广播 / 组播**：本就不是合法的 DNAT 单播目标。
+///
+/// 刻意**不**拦 RFC1918 私网与 100.64/10 CGNAT 整段：「公网端口 → 内网 LAN 服务」「转发到
+/// Tailscale 远端」都是合法用途（ADR 0005），拦了会回归既有功能。调用点须对**每次解析后**
+/// 的 IP 复检（覆盖域名 DNS 重绑定），见 agent `forward::resolve_one`。
+pub fn forbidden_forward_target(ip: Ipv4Addr) -> Option<&'static str> {
+    if CLOUD_METADATA_IPS.contains(&ip) {
+        Some("云元数据端点（阿里云 100.100.100.200，可窃取 RAM/STS 凭证）")
+    } else if ip.is_loopback() {
+        Some("环回地址（会把本机管理面/本地服务暴露到公网）")
+    } else if ip.is_link_local() {
+        Some("链路本地地址（含云元数据 169.254.169.254）")
+    } else if ip.octets()[0] == 0 {
+        Some("0.0.0.0/8（本网络，非法单播目标）")
+    } else if ip.is_broadcast() {
+        Some("广播地址")
+    } else if ip.is_multicast() {
+        Some("组播地址")
+    } else {
+        None
+    }
+}
+
 /// 校验监听/目标端口区间：各自合法，且区间长度匹配（或目标为单端口）。
 pub fn validate_ports(listen: &PortRange, dest: &PortRange) -> Result<(), String> {
     if !listen.is_valid() || !dest.is_valid() {
@@ -283,5 +338,80 @@ mod tests {
     fn proto_expands() {
         assert_eq!(ForwardProto::Both.l4_protos(), &["tcp", "udp"]);
         assert_eq!(ForwardProto::Udp.l4_protos(), &["udp"]);
+    }
+
+    #[test]
+    fn valid_iface_names_accepted() {
+        // 真实网卡名都应通过（含 VLAN 点号、网桥连字符、下划线、单字符）。
+        for ok in [
+            "eth0", "ens18", "enp0s3", "br-lan", "wg0", "tailscale0", "eth0.100", "bond0", "a",
+            "veth_abc", "ABCDEFGHIJKLMNO", // 15 字符上限
+        ] {
+            assert!(valid_iface_name(ok), "{ok:?} 应合法");
+        }
+    }
+
+    #[test]
+    fn injection_iface_names_rejected() {
+        // 任何能逃逸 `iifname "{iface}"` 的字符/形态都必须拒。
+        for bad in [
+            "",
+            "eth0\"",                  // 闭合引号
+            "eth0\nflush ruleset",     // 换行注入
+            "a b",                     // 空格
+            "x;reboot",                // 分号
+            "eth0{",                   // 花括号
+            "eth0}",
+            "eth0\\",                  // 反斜杠
+            "../etc",                  // 斜杠
+            "ABCDEFGHIJKLMNOP",        // 16 字符，超 IFNAMSIZ-1
+            "网卡",                    // 非 ASCII
+        ] {
+            assert!(!valid_iface_name(bad), "{bad:?} 应被拒");
+        }
+    }
+
+    #[test]
+    fn forbidden_targets_blocked() {
+        for ip in [
+            "127.0.0.1",
+            "127.5.6.7",       // 整个 127/8
+            "169.254.169.254", // 通用云元数据
+            "169.254.0.1",
+            "100.100.100.200", // 阿里云元数据（在 100.64/10 内，按精确 IP 拦）
+            "100.100.100.136", // 阿里云同族端点
+            "0.0.0.0",
+            "0.1.2.3",   // 0.0.0.0/8 本网络
+            "0.255.0.1", // 0.0.0.0/8
+            "255.255.255.255",
+            "224.0.0.1", // 组播
+            "239.1.2.3",
+        ] {
+            assert!(
+                forbidden_forward_target(ip.parse().unwrap()).is_some(),
+                "{ip} 应被拒"
+            );
+        }
+    }
+
+    #[test]
+    fn legit_targets_allowed_including_private_lan() {
+        // 公网 + 私网 LAN 都是合法转发目标，绝不能误伤（防回归）。
+        for ip in [
+            "1.2.3.4",
+            "8.8.8.8",
+            "203.0.113.9",
+            "10.0.0.5",     // RFC1918
+            "192.168.1.10", // RFC1918
+            "172.16.0.1",   // RFC1918
+            "100.64.0.1",   // CGNAT/Tailscale 远端（整段放行）
+            "100.100.100.1", // 100.64/10 内、但非阿里云元数据 → 允许（精确拦，不拦整段）
+            "100.127.255.254",
+        ] {
+            assert!(
+                forbidden_forward_target(ip.parse().unwrap()).is_none(),
+                "{ip} 应允许（含私网 LAN / CGNAT，ADR 0005 合法用途）"
+            );
+        }
     }
 }

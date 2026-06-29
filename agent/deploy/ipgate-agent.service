@@ -21,6 +21,11 @@ ProtectSystem=strict
 # /etc/shadow 并在 /etc 下建锁/临时/备份文件。没有它，ProtectSystem=strict 会让这些写操作
 # 在服务的 mount namespace 里报「只读文件系统」（手动 shell 改没事，服务改不了）。
 ReadWritePaths=/var/lib/ipgate /etc
+# chpasswd 离不开整个 /etc 可写（建 .pwd.lock、shadow 的 temp+rename 都在 /etc 目录里），
+# 没法只列具体文件；于是把「写一下就能提权/持久化」且本服务从不读写的子树挖空，缩小
+# 「任意 /etc 写」被滥用的爆炸半径。刻意不含 ld.so.preload（会影响每次 exec 的动态链接器）、
+# pam.d（chpasswd/sshd 要读）、/etc/systemd（systemctl 行为不确定）——避免回归。
+InaccessiblePaths=-/etc/sudoers -/etc/sudoers.d -/etc/cron.d -/etc/crontab -/etc/cron.daily -/etc/cron.hourly -/etc/cron.weekly -/etc/cron.monthly
 ProtectHome=yes
 PrivateTmp=yes
 ProtectControlGroups=yes

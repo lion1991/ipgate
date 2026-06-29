@@ -114,6 +114,9 @@ ProtectSystem=strict
 # /etc 可写：开关 SSH 密码登录改 /etc/ssh/sshd_config；重置 root 密码 chpasswd 写 /etc/shadow
 # 并在 /etc 下建锁/临时/备份文件。缺它 ProtectSystem=strict 会让服务里这些写操作报「只读」。
 ReadWritePaths=/var/lib/ipgate /etc
+# chpasswd 需整个 /etc 可写，无法只列文件；把本服务从不读写、却「写一下即可提权/持久化」的
+# 子树挖空，缩小爆炸半径。刻意不含 ld.so.preload/pam.d//etc/systemd（避免影响 exec/chpasswd/systemctl）。
+InaccessiblePaths=-/etc/sudoers -/etc/sudoers.d -/etc/cron.d -/etc/crontab -/etc/cron.daily -/etc/cron.hourly -/etc/cron.weekly -/etc/cron.monthly
 ProtectHome=yes
 PrivateTmp=yes
 ProtectControlGroups=yes

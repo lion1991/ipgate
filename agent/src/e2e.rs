@@ -360,3 +360,33 @@ async fn whoami_reports_peer_ip() {
     assert!(who.ip.is_loopback(), "本测试经 loopback 连接");
     let _ = std::fs::remove_dir_all(&srv.data_dir);
 }
+
+/// P1 修复：撤销设备会立刻断掉它的**在途** Noise 连接（原先只改 store，连接照用）。
+#[tokio::test]
+async fn revoke_device_closes_live_connection() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("phone".into()) },
+    )
+    .await
+    .unwrap();
+
+    // 拿到本设备 id。
+    let devices: Vec<Device> = cli.ok(RpcRequest::ListDevices).await;
+    let id = devices[0].id;
+
+    // 自撤销：这条请求本身仍被处理（循环顶部复验时设备尚在）。
+    assert!(matches!(cli.rpc(RpcRequest::RevokeDevice(id)).await, RpcResponse::Ok(_)));
+
+    // 下一条请求：循环顶部复验发现设备已撤销 → agent 关连接，客户端 recv 拿到 EOF/错误。
+    cli.conn
+        .send(&serde_json::to_vec(&RpcRequest::ListAllowlist).unwrap())
+        .await
+        .unwrap();
+    assert!(cli.conn.recv().await.is_err(), "撤销后在途连接应被 agent 关闭");
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
