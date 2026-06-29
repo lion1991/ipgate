@@ -13,6 +13,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+
+/// 容忍中毒的取锁扩展（P1 修复：防 Mutex 中毒级联）。
+///
+/// `std::sync::Mutex` 一旦某个持有者在临界区内 panic 即**永久中毒**，之后所有
+/// `lock().unwrap()` 都会 panic。原先这会把对账线程（防火墙漂移自愈）、TTL 清理、
+/// 以及每条 RPC 一起拖死，进程却仍卡在 `block_on` 不退出 → systemd 不重启、防火墙可能
+/// fail-open。`lock_safe()` 在中毒时取回内层数据继续跑：Store 的变更要么是 Vec 增删、
+/// 要么随后 `save()` 落盘，最坏只是一次半更新的内存态，远好于守护进程僵死。
+pub trait LockExt<T> {
+    fn lock_safe(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> LockExt<T> for Mutex<T> {
+    fn lock_safe(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct State {
@@ -240,6 +258,24 @@ mod tests {
             note: String::new(),
             expires_at: None,
         }
+    }
+
+    #[test]
+    fn lock_safe_recovers_from_poison() {
+        use std::sync::{Arc, Mutex};
+        let m = Arc::new(Mutex::new(0u32));
+        // 在持锁时 panic → 毒死该锁（模拟某个 handler 在临界区 panic）。
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("临界区内 panic");
+        })
+        .join();
+        // 标准 lock() 此刻返回 Err(Poisoned)，原代码的 .unwrap() 会在这里级联 panic。
+        assert!(m.lock().is_err(), "前置：锁应已中毒");
+        // lock_safe 取回内层数据继续工作 —— 这正是防级联的关键。
+        *m.lock_safe() = 42;
+        assert_eq!(*m.lock_safe(), 42);
     }
 
     fn temp_store() -> Store {

@@ -21,6 +21,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// 静态密钥持久化文件（`data_dir/noise_static.key`，0600，内容 = priv32‖pub32）。
 const STATIC_FILE: &str = "noise_static.key";
 
+/// 单条逻辑消息（解密后）字节上限。`RpcRequest` 实际只有几 KB；设 1 MiB 已极宽松，
+/// 用来挡住 4B 长度头声明上 GiB、再灌帧把堆撑爆 OOM 杀掉 root 守护进程的 DoS（P1 修复）。
+const NOISE_MAX_MSG: usize = 1 << 20;
+
 fn params() -> Result<snow::params::NoiseParams> {
     NOISE_PATTERN.parse().context("Noise 模式串非法")
 }
@@ -138,6 +142,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> NoiseConn<S> {
                 .transport
                 .read_message(&frame, &mut buf)
                 .map_err(|e| anyhow::anyhow!("Noise 解密失败：{e}"))?;
+            // 0 明文帧（如只含 16B AEAD tag）永不合法：send() 每条逻辑消息首帧必带 4B 长度头。
+            // 不挡的话攻击者可一直灌这种帧，out 永不前进、卡在长度判定前空转（绕过长度上限）。
+            if n == 0 {
+                bail!("收到空明文 Noise 帧");
+            }
             buf.truncate(n);
             out.extend_from_slice(&buf);
             if total.is_none() {
@@ -145,6 +154,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> NoiseConn<S> {
                     continue;
                 }
                 let len = u32::from_be_bytes(out[..4].try_into().unwrap()) as usize;
+                if len > NOISE_MAX_MSG {
+                    bail!("Noise 逻辑消息过大：{len} 字节 > 上限 {NOISE_MAX_MSG}");
+                }
                 out.drain(..4);
                 total = Some(len);
             }

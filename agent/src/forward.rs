@@ -7,7 +7,7 @@
 use crate::netinfo;
 use crate::nft::{NatBackend, ResolvedForward};
 use crate::resolve;
-use crate::store::Store;
+use crate::store::{LockExt, Store};
 use ipgate_proto::{ForwardId, ForwardRule, ForwardSource};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -26,7 +26,15 @@ type Nat = Arc<dyn NatBackend + Send + Sync>;
 /// - SNAT 源：`auto` 取网卡首个 IPv4；显式 IP 若已不在网卡上则回退当前网卡 IP（IP 漂移自愈）。
 fn resolve_one(rule: &ForwardRule, prev: Option<Ipv4Addr>) -> Result<ResolvedForward, String> {
     let iface = match &rule.iface {
-        Some(i) => i.clone(),
+        Some(i) => {
+            // 安全闸：网卡名要被原样插进 `nft -f` 的 `iifname "{}"`，非白名单字符
+            // 可注入任意 nftables 语句（见 proto::valid_iface_name）。落地前再挡一道，
+            // 兜住任何绕过 API 校验写进 store 的脏数据。
+            if !ipgate_proto::valid_iface_name(i) {
+                return Err(format!("非法网卡名 {i:?}（仅允许字母数字与 . _ -，≤15）"));
+            }
+            i.clone()
+        }
         None => netinfo::default_route_iface()
             .ok_or_else(|| "无默认路由网卡，且未指定 iface".to_string())?,
     };
@@ -35,6 +43,12 @@ fn resolve_one(rule: &ForwardRule, prev: Option<Ipv4Addr>) -> Result<ResolvedFor
         Some(ip) => ip,
         None => prev.ok_or_else(|| format!("解析 {} 失败且无历史 IP", rule.dest_host))?,
     };
+    // 安全闸：拒绝把流量 DNAT 到环回/链路本地等禁区。**每次解析后**都查，故能挡住
+    // 域名先解析到良性 IP、之后被 DNS 重绑定到 127.0.0.1:<mgmt>/169.254.169.254 的攻击
+    // （周期 resolve_loop 同样走这里）。私网 LAN 不拦，保留 ADR 0005 合法转发用途。
+    if let Some(why) = ipgate_proto::forbidden_forward_target(remote_ip) {
+        return Err(format!("目标 {remote_ip} 被拒：{why}"));
+    }
 
     let source_ip = match rule.source {
         ForwardSource::Auto => netinfo::first_ipv4(&iface)
@@ -64,7 +78,7 @@ fn resolve_all(
     store: &Arc<Mutex<Store>>,
 ) -> (Vec<ResolvedForward>, HashMap<ForwardId, Ipv4Addr>, Vec<String>) {
     let (rules, prev): (Vec<ForwardRule>, HashMap<ForwardId, Ipv4Addr>) = {
-        let s = store.lock().unwrap();
+        let s = store.lock_safe();
         let rules = s.forwards().to_vec();
         let prev = rules
             .iter()
@@ -109,7 +123,7 @@ fn commit(
         }
         nat.apply_nat(resolved)?;
     }
-    let mut s = store.lock().unwrap();
+    let mut s = store.lock_safe();
     s.set_resolved(new_map);
     let _ = s.save();
     Ok(())
@@ -156,4 +170,54 @@ pub fn resolve_loop(store: Arc<Mutex<Store>>, nat: Nat, interval: u64) {
             Err(e) => warn!(error = %e, "转发：周期落地失败（保留上次状态）"),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ipgate_proto::{ForwardProto, PortRange};
+
+    fn rule(iface: Option<&str>, dest: &str) -> ForwardRule {
+        ForwardRule {
+            id: ForwardId::new(),
+            proto: ForwardProto::Tcp,
+            iface: iface.map(|s| s.to_string()),
+            listen: PortRange::single(443),
+            dest_host: dest.to_string(),
+            dest_port: PortRange::single(8443),
+            source: ForwardSource::Auto,
+            note: String::new(),
+            created_at: chrono::Utc::now(),
+            created_by: ipgate_proto::DeviceId::new(),
+        }
+    }
+
+    // 注：iface 校验在最前、目标禁区校验紧随域名解析之后，二者都先于任何 `ip` 子进程，
+    // 故这些断言不依赖测试机的网络/iproute2 环境，结果确定。
+
+    #[test]
+    fn resolve_one_rejects_injection_iface() {
+        let r = rule(Some("eth0\"\nflush ruleset"), "1.2.3.4");
+        let err = resolve_one(&r, None).unwrap_err();
+        assert!(err.contains("非法网卡名"), "应因网卡名被拒，实际：{err}");
+    }
+
+    #[test]
+    fn resolve_one_rejects_loopback_target() {
+        // 把转发目标设成本机环回（典型攻击：暴露 loopback-only 管理面）。
+        let r = rule(Some("eth0"), "127.0.0.1");
+        let err = resolve_one(&r, None).unwrap_err();
+        assert!(err.contains("被拒") && err.contains("环回"), "实际：{err}");
+    }
+
+    #[test]
+    fn resolve_one_rejects_metadata_target() {
+        let r = rule(Some("eth0"), "169.254.169.254");
+        let err = resolve_one(&r, None).unwrap_err();
+        assert!(err.contains("被拒") && err.contains("链路本地"), "实际：{err}");
+    }
+
+    // 注：prev 回退路径（域名解析失败时退回上次成功 IP）也走同一个 `remote_ip` 禁区检查，
+    // 故安全属性与上面字面量用例同源；此处不再单测，因为无法在不联网/不被解析器劫持
+    // NXDOMAIN 的前提下确定性地“强制解析失败”。
 }

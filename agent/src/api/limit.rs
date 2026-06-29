@@ -2,6 +2,7 @@
 //!
 //! 合法客户端只是偶尔轮询，配额给得很宽；超额的基本只有扫描器/爆破。
 
+use crate::store::LockExt;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -28,7 +29,7 @@ impl RateLimiter {
         if self.max == 0 {
             return true;
         }
-        let mut m = self.inner.lock().unwrap();
+        let mut m = self.inner.lock_safe();
         // 内存兜底：表过大时顺手清掉过期窗口（避免被海量伪造源 IP 撑爆）。
         if m.len() > 10_000 {
             m.retain(|_, (start, _)| now.duration_since(*start) < self.window);

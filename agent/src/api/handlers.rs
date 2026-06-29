@@ -7,6 +7,7 @@
 use super::error::{internal, ApiResult};
 use super::AppState;
 use crate::reconcile;
+use crate::store::LockExt;
 use chrono::Utc;
 use ipgate_proto::{
     validate_ports, AddForwardRequest, AgentSettings, AllowRequest, Allowlist, ApiError, Device,
@@ -19,7 +20,7 @@ use std::net::IpAddr;
 // ---- 放行名单 ----
 
 pub fn list_allowlist(st: &AppState) -> ApiResult<Allowlist> {
-    let store = st.store.lock().unwrap();
+    let store = st.store.lock_safe();
     Ok(Allowlist {
         entries: store.entries().to_vec(),
         revision: store.revision(),
@@ -30,7 +31,7 @@ pub fn allow(st: &AppState, by: DeviceId, req: AllowRequest) -> ApiResult<Entry>
     let now = Utc::now();
     // 存储为期望态权威：先持久化，再落内核（落内核失败也会被对账循环补上）。
     let entry = {
-        let mut store = st.store.lock().unwrap();
+        let mut store = st.store.lock_safe();
         let entry = store.allow(req, by, now);
         store.save().map_err(internal)?;
         entry
@@ -43,7 +44,7 @@ pub fn allow(st: &AppState, by: DeviceId, req: AllowRequest) -> ApiResult<Entry>
 
 pub fn revoke(st: &AppState, req: RevokeRequest) -> ApiResult<()> {
     let target = {
-        let mut store = st.store.lock().unwrap();
+        let mut store = st.store.lock_safe();
         let target = match req {
             RevokeRequest::Target(t) => t,
             RevokeRequest::Id(id) => store
@@ -78,7 +79,7 @@ pub fn sync(st: &AppState) -> ApiResult<Diff> {
         .backend
         .list()
         .map_err(|e| ApiError::new(ErrorCode::NftFailure, e.to_string()))?;
-    let store = st.store.lock().unwrap();
+    let store = st.store.lock_safe();
     Ok(reconcile::diff(store.entries(), &kernel, now))
 }
 
@@ -98,7 +99,7 @@ fn build_settings(st: &AppState, ssh_allowlist_only: bool) -> AgentSettings {
 }
 
 pub fn get_settings(st: &AppState) -> AgentSettings {
-    let allowlist_only = st.store.lock().unwrap().ssh_allowlist_only();
+    let allowlist_only = st.store.lock_safe().ssh_allowlist_only();
     build_settings(st, allowlist_only)
 }
 
@@ -110,7 +111,7 @@ pub fn get_settings(st: &AppState) -> AgentSettings {
 pub fn set_ssh_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<AgentSettings> {
     let now = Utc::now();
     let entries = {
-        let mut store = st.store.lock().unwrap();
+        let mut store = st.store.lock_safe();
         if allowlist_only {
             let live = store.entries().iter().filter(|e| !e.is_expired(now)).count();
             if live == 0 {
@@ -137,7 +138,7 @@ pub fn set_ssh_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<AgentS
 pub fn set_ssh_password_auth(st: &AppState, enabled: bool) -> ApiResult<AgentSettings> {
     crate::sshd::set_password_auth(enabled)
         .map_err(|e| ApiError::new(ErrorCode::Internal, format!("{e:#}")))?;
-    let allowlist_only = st.store.lock().unwrap().ssh_allowlist_only();
+    let allowlist_only = st.store.lock_safe().ssh_allowlist_only();
     Ok(build_settings(st, allowlist_only))
 }
 
@@ -192,7 +193,7 @@ fn native_unified(store: &crate::store::Store, rule: ForwardRule) -> UnifiedForw
 /// 统一转发列表：native（`ip ipgate_nat`）+ dnat（`dnat_utils`，启用时），跨来源标冲突。
 pub fn list_forwards(st: &AppState) -> ApiResult<UnifiedForwardList> {
     let (mut forwards, revision) = {
-        let store = st.store.lock().unwrap();
+        let store = st.store.lock_safe();
         let native: Vec<UnifiedForwardView> = store
             .forwards()
             .iter()
@@ -235,12 +236,39 @@ pub fn list_forwards(st: &AppState) -> ApiResult<UnifiedForwardList> {
     Ok(UnifiedForwardList { forwards, revision })
 }
 
+/// 转发入参安全校验（即时反馈）：
+/// - 网卡名白名单，杜绝注入 `nft -f`（见 [`ipgate_proto::valid_iface_name`]）。
+/// - 目标若是 IPv4 **字面量**，挡掉环回/链路本地等禁区（SSRF / 暴露管理面）。
+///
+/// 域名目标的禁区校验放在落地解析处（[`crate::forward`] 的 `resolve_one`），因为要对
+/// **每次重解析**复检以覆盖 DNS 重绑定——这里只能查到当下字面量。两道闸互补。
+fn validate_forward_input(iface: &Option<String>, dest_host: &str) -> ApiResult<()> {
+    if let Some(i) = iface {
+        if !ipgate_proto::valid_iface_name(i) {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "网卡名非法（仅允许字母数字与 . _ -，≤15 字符）",
+            ));
+        }
+    }
+    if let Ok(ip) = dest_host.trim().parse::<std::net::Ipv4Addr>() {
+        if let Some(why) = ipgate_proto::forbidden_forward_target(ip) {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                format!("目标地址不允许：{why}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn add_forward(st: &AppState, by: DeviceId, req: AddForwardRequest) -> ApiResult<ForwardView> {
     validate_ports(&req.listen, &req.dest_port)
         .map_err(|e| ApiError::new(ErrorCode::BadRequest, e))?;
     if req.dest_host.trim().is_empty() {
         return Err(ApiError::new(ErrorCode::BadRequest, "目标主机为空"));
     }
+    validate_forward_input(&req.iface, &req.dest_host)?;
 
     // 碰撞检测（ADR 0006 排空模型）：监听端口被本机 dnat 规则占用则拒，引导先迁移。
     if st.dnat.present() {
@@ -261,7 +289,7 @@ pub fn add_forward(st: &AppState, by: DeviceId, req: AddForwardRequest) -> ApiRe
 
     let now = Utc::now();
     let rule = {
-        let mut store = st.store.lock().unwrap();
+        let mut store = st.store.lock_safe();
         let rule = store.add_forward(req, by, now);
         store.save().map_err(internal)?;
         rule
@@ -272,7 +300,7 @@ pub fn add_forward(st: &AppState, by: DeviceId, req: AddForwardRequest) -> ApiRe
     crate::forward::apply_now(&st.store, &st.nat)
         .map_err(|e| ApiError::new(ErrorCode::NftFailure, e.to_string()))?;
 
-    let store = st.store.lock().unwrap();
+    let store = st.store.lock_safe();
     Ok(forward_view(&store, rule_by_id(&store, id).unwrap_or(rule)))
 }
 
@@ -283,7 +311,7 @@ fn rule_by_id(store: &crate::store::Store, id: ForwardId) -> Option<ForwardRule>
 
 pub fn remove_forward(st: &AppState, id: ForwardId) -> ApiResult<()> {
     {
-        let mut store = st.store.lock().unwrap();
+        let mut store = st.store.lock_safe();
         if !store.remove_forward(id) {
             return Err(ApiError::new(ErrorCode::NotFound, "转发规则不存在"));
         }
@@ -333,10 +361,12 @@ pub fn migrate_dnat_forward(st: &AppState, by: DeviceId, key: &str) -> ApiResult
             format!("该 dnat 规则的端口映射 native 不支持，无法迁移：{e}"),
         )
     })?;
+    // 防御性：dnat conf 里的网卡名/字面量目标同样过安全闸（正常都是真网卡名，恒通过）。
+    validate_forward_input(&req.iface, &req.dest_host)?;
 
     // 目标 (网卡,端口) 已有 native 转发则拒——否则 store.add_forward 会静默覆盖它。
     {
-        let store = st.store.lock().unwrap();
+        let store = st.store.lock_safe();
         let clobbers = store.forwards().iter().any(|f| {
             effective_iface(&f.iface).as_deref() == Some(rule.iface.as_str())
                 && f.listen.overlaps(&rule.listen)
@@ -352,7 +382,7 @@ pub fn migrate_dnat_forward(st: &AppState, by: DeviceId, key: &str) -> ApiResult
     // 先建 native(-90)（dnat(-100) 仍先匹配→零抖动）。
     let now = Utc::now();
     let new_rule = {
-        let mut store = st.store.lock().unwrap();
+        let mut store = st.store.lock_safe();
         let r = store.add_forward(req, by, now);
         store.save().map_err(internal)?;
         r
@@ -362,10 +392,10 @@ pub fn migrate_dnat_forward(st: &AppState, by: DeviceId, key: &str) -> ApiResult
         .map_err(|e| ApiError::new(ErrorCode::NftFailure, e.to_string()))?;
 
     // 确认 native 真生效（解析成功＝已进内核）；否则回滚僵尸规则、保留 dnat。
-    let live = st.store.lock().unwrap().resolved_ip(id).is_some();
+    let live = st.store.lock_safe().resolved_ip(id).is_some();
     if !live {
         {
-            let mut store = st.store.lock().unwrap();
+            let mut store = st.store.lock_safe();
             store.remove_forward(id);
             let _ = store.save();
         }
@@ -384,7 +414,7 @@ pub fn migrate_dnat_forward(st: &AppState, by: DeviceId, key: &str) -> ApiResult
         ));
     }
 
-    let store = st.store.lock().unwrap();
+    let store = st.store.lock_safe();
     Ok(forward_view(&store, rule_by_id(&store, id).unwrap_or(new_rule)))
 }
 
@@ -396,11 +426,11 @@ pub fn list_interfaces() -> Vec<InterfaceInfo> {
 }
 
 pub fn list_devices(st: &AppState) -> Vec<Device> {
-    st.store.lock().unwrap().devices().to_vec()
+    st.store.lock_safe().devices().to_vec()
 }
 
 pub fn revoke_device(st: &AppState, id: DeviceId) -> ApiResult<()> {
-    let mut store = st.store.lock().unwrap();
+    let mut store = st.store.lock_safe();
     if !store.remove_device(id) {
         return Err(ApiError::new(ErrorCode::NotFound, "设备不存在"));
     }
