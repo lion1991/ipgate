@@ -1,0 +1,74 @@
+# wrlog（Forgejo）上的发版：打 v* tag 即构建静态 musl 二进制 + 部署包，挂到 Forgejo release，
+# 对应 .github/workflows/release.yml（资产命名保持一致，install.sh 换个源也能直接用）。
+# 也可在 Actions 页手动运行，补发 .forgejo/ 加入之前就已存在的 tag。runner 标签说明见 build.yml。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要发布的 tag（必须已存在）
+        required: true
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  release:
+    runs-on: go
+    timeout-minutes: 40
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 脚本取自工作流所在的提交，再切到要发布的 tag——补发旧 tag 时，那个提交里还没有 .forgejo/。
+      - name: 切到要发布的 tag
+        run: |
+          cp -r .forgejo/scripts "$RUNNER_TEMP/ci"
+          git checkout --detach "$TAG"
+
+      - name: 安装 Rust + musl
+        id: rust
+        run: sh "$RUNNER_TEMP/ci/setup-rust.sh"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ steps.rust.outputs.deps }}
+
+      # 用 tag 名作为二进制版本（去掉前缀 v），使 `ipgate-agent -V` 与 release 一致。
+      - name: Set version from tag
+        run: sed -i "s/^version = .*/version = \"${TAG#v}\"/" agent/Cargo.toml
+
+      - name: Build + package
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl -p ipgate-agent
+          BIN=target/x86_64-unknown-linux-musl/release/ipgate-agent
+          strip "$BIN"
+          rm -rf stage dist && mkdir -p stage/ipgate-agent dist
+          cp "$BIN" stage/ipgate-agent/ipgate-agent
+          cp agent/deploy/install.sh agent/deploy/uninstall.sh \
+             agent/deploy/ipgate-agent.service agent/deploy/config.example.json \
+             stage/ipgate-agent/
+          chmod +x stage/ipgate-agent/*.sh
+          tar -C stage -czf dist/ipgate-agent-x86_64-unknown-linux-musl.tar.gz ipgate-agent
+          cp "$BIN" dist/ipgate-agent-x86_64-unknown-linux-musl
+          (cd dist && sha256sum ipgate-agent-x86_64-unknown-linux-musl* > SHA256SUMS)
+          ls -l dist && cat dist/SHA256SUMS
+
+      - name: 上传到 Forgejo release
+        env:
+          # Forgejo Actions 自动注入的仓库令牌（meshgate 发版同样用它）。
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SERVER: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+        run: NOTES="$(git tag -l --format='%(contents)' "$TAG")" sh "$RUNNER_TEMP/ci/upload-release-assets.sh" dist

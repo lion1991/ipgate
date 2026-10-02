@@ -1,0 +1,52 @@
+# wrlog（Forgejo）上的主干构建：推 main 即测试 + 编静态 musl 二进制，对应 .github/workflows/build.yml。
+#
+# 有了 .forgejo/workflows，Forgejo 就不再读 .github/workflows；GitHub 也不读这里——两边各跑各的。
+# runs-on 是这台实例上 runner 注册时起的标签（go = vm-debian13 的 Linux 构建机），不是 GitHub 那套
+# ubuntu-latest：写成后者会一直卡在「没有匹配标签的在线运行器」。
+name: build-agent
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # CI 不需要增量编译；关掉能让缓存的 target 小很多。
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    runs-on: go
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust + musl
+        id: rust
+        run: sh .forgejo/scripts/setup-rust.sh
+
+      # 精确 key、不配 restore-keys：部分命中 = 没命中主 key，post 步骤会把整包缓存再传一遍。
+      # release.yml 用同一把 key，发版时直接复用这里攒下的依赖产物。
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ steps.rust.outputs.deps }}
+
+      - name: Test (proto + agent)
+        run: cargo test --workspace
+
+      - name: Build agent (static musl)
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl -p ipgate-agent
+          strip target/x86_64-unknown-linux-musl/release/ipgate-agent
+
+      # 必须是 v3：act_runner 对外自称 GHES，upload-artifact@v4 会直接抛 GHESNotSupportedError。
+      - uses: actions/upload-artifact@v3
+        with:
+          name: ipgate-agent-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/ipgate-agent
+          retention-days: 14

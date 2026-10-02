@@ -59,6 +59,11 @@ sudo deploy/install.sh           # root；探测 ufw/firewalld、生成仅转发
 sudo deploy/uninstall.sh --purge # 停服务 + flush 表 + 删数据
 ```
 
+> **发版**：`git tag -a vX.Y.Z` 后推到 `origin`（GitHub）与 `wrlog`（git.wrlog.cn，Forgejo），两边 CI 各自
+> 构建并发布同名资产的 release：GitHub 走 `.github/workflows/`，Forgejo 走 `.forgejo/workflows/`（runner
+> 标签 `go`；有了它 Forgejo 就不再读 `.github/`）。Forgejo 的 release 也可在 Actions 页手动运行补发旧 tag。
+> `install.sh` 目前从 GitHub 下载。
+
 > ⚠️ default-drop 一旦生效，除 **SSH 端口（`ssh_port`，默认 22，无条件放行）**/established/放行名单/公开端口外一律拒。SSH 是唯一入口、结构性**不自锁**（ADR 0007）；其余对外服务端口请写进 `public_tcp`。
 >
 > 🔒 **SSH 仅名单可连**（可选，默认关）：客户端开关或 `ssh-expose --allowlist` 可把 22 收窄为仅放行名单内源 IP 可连（去掉无条件放行，改由 `saddr @allow` 命中）。有自锁风险——开启前先放行自己；锁死了从控制台 `ssh-expose --open` 恢复。状态存 `state.json`（`ssh_allowlist_only`）。
