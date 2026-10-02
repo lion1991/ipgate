@@ -262,7 +262,8 @@ fn validate_forward_input(iface: &Option<String>, dest_host: &str) -> ApiResult<
     Ok(())
 }
 
-pub fn add_forward(st: &AppState, by: DeviceId, req: AddForwardRequest) -> ApiResult<ForwardView> {
+/// 新增 / 修改共用的入参校验：端口区间、目标、安全闸，以及与本机 dnat 规则的碰撞。
+fn check_forward_request(st: &AppState, req: &AddForwardRequest) -> ApiResult<()> {
     validate_ports(&req.listen, &req.dest_port)
         .map_err(|e| ApiError::new(ErrorCode::BadRequest, e))?;
     if req.dest_host.trim().is_empty() {
@@ -286,6 +287,11 @@ pub fn add_forward(st: &AppState, by: DeviceId, req: AddForwardRequest) -> ApiRe
             }
         }
     }
+    Ok(())
+}
+
+pub fn add_forward(st: &AppState, by: DeviceId, req: AddForwardRequest) -> ApiResult<ForwardView> {
+    check_forward_request(st, &req)?;
 
     let now = Utc::now();
     let rule = {
@@ -307,6 +313,37 @@ pub fn add_forward(st: &AppState, by: DeviceId, req: AddForwardRequest) -> ApiRe
 /// 落地后重新取一遍规则（拿到最新 resolved 状态）。
 fn rule_by_id(store: &crate::store::Store, id: ForwardId) -> Option<ForwardRule> {
     store.find_forward(id).cloned()
+}
+
+/// 原地修改一条 native 转发（id 不变）。与其它 native 规则 (有效网卡, 监听端口) 重叠则拒：
+/// 新增路径按 (iface, listen) 去重会静默覆盖，编辑时那等于悄悄删掉另一条。
+pub fn update_forward(st: &AppState, id: ForwardId, req: AddForwardRequest) -> ApiResult<ForwardView> {
+    check_forward_request(st, &req)?;
+
+    let rule = {
+        let mut store = st.store.lock_safe();
+        let default_iface = crate::netinfo::default_route_iface();
+        let eff = |i: &Option<String>| i.clone().or_else(|| default_iface.clone());
+        let target = eff(&req.iface);
+        let clash = store
+            .forwards()
+            .iter()
+            .any(|f| f.id != id && eff(&f.iface) == target && f.listen.overlaps(&req.listen));
+        if clash {
+            return Err(ApiError::new(ErrorCode::Conflict, "监听端口与另一条转发重叠"));
+        }
+        let rule = store
+            .update_forward(id, req)
+            .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "转发规则不存在"))?;
+        store.save().map_err(internal)?;
+        rule
+    };
+
+    crate::forward::apply_now(&st.store, &st.nat)
+        .map_err(|e| ApiError::new(ErrorCode::NftFailure, e.to_string()))?;
+
+    let store = st.store.lock_safe();
+    Ok(forward_view(&store, rule_by_id(&store, id).unwrap_or(rule)))
 }
 
 pub fn remove_forward(st: &AppState, id: ForwardId) -> ApiResult<()> {

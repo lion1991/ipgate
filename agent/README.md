@@ -80,7 +80,7 @@ sudo deploy/uninstall.sh --purge # 停服务 + flush 表 + 删数据
 RPC op（握手后，隧道内 JSON）：
   list_allowlist / allow / revoke           放行名单 列出 / 放行 / 撤销
   sync                                      内核 vs 存储差异
-  list_forwards / add_forward / remove_forward          端口转发（ADR 0005）
+  list_forwards / add_forward / update_forward / remove_forward   端口转发（ADR 0005；update 原地改、保留 id）
   remove_dnat / migrate_dnat                dnat 适配（ADR 0006）
   list_interfaces                           列主机网卡（客户端下拉用）
   list_devices / revoke_device              已授权设备 / 吊销
@@ -96,7 +96,7 @@ RPC op（握手后，隧道内 JSON）：
 ## 开发
 
 ```sh
-cargo test                  # 75 项：Noise 握手/配对 + 放行→撤销 + 端口转发 CRUD + SSH 暴露切换 端到端（真 TCP+Noise）+ ruleset/nat 渲染 + 隧道密钥种子抽取 + sshd 认证态势解析/受管块插入·剥离
+cargo test                  # 102 项（agent + proto）：Noise 握手/配对 + 放行→撤销 + 端口转发增删改 + SSH 暴露切换 端到端（真 TCP+Noise）+ ruleset/nat 渲染 + 隧道密钥种子抽取 + sshd 认证态势解析/受管块插入·剥离
 cargo clippy --all-targets
 cargo run -- --config <cfg> print-ruleset   # 非 Linux 可跑（纯渲染）
 cargo run -- --config <cfg> pair            # 非 Linux 可跑（生成 Noise 密钥 + 配对码）

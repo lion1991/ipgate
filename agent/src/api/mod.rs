@@ -268,6 +268,7 @@ fn dispatch(st: &AppState, device: DeviceId, peer_ip: IpAddr, req: RpcRequest) -
         Sync => to_val(handlers::sync(st)?),
         ListForwards => to_val(handlers::list_forwards(st)?),
         AddForward(r) => to_val(handlers::add_forward(st, device, r)?),
+        UpdateForward { id, rule } => to_val(handlers::update_forward(st, id, rule)?),
         RemoveForward(id) => {
             handlers::remove_forward(st, id)?;
             Ok(serde_json::Value::Null)

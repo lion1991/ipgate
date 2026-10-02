@@ -209,6 +209,24 @@ impl Store {
         rule
     }
 
+    /// 原地修改规则，保留 id 与创建信息。目标变了就丢掉旧解析缓存——否则新域名解析失败时会回退到旧目标 IP。
+    pub fn update_forward(&mut self, id: ForwardId, req: AddForwardRequest) -> Option<ForwardRule> {
+        let rule = self.state.forwards.iter_mut().find(|f| f.id == id)?;
+        if rule.dest_host != req.dest_host {
+            self.state.resolved.remove(&id);
+        }
+        rule.proto = req.proto;
+        rule.iface = req.iface;
+        rule.listen = req.listen;
+        rule.dest_host = req.dest_host;
+        rule.dest_port = req.dest_port;
+        rule.source = req.source;
+        rule.note = req.note;
+        let out = rule.clone();
+        self.state.forward_revision += 1;
+        Some(out)
+    }
+
     pub fn remove_forward(&mut self, id: ForwardId) -> bool {
         let before = self.state.forwards.len();
         self.state.forwards.retain(|f| f.id != id);
@@ -376,6 +394,28 @@ mod tests {
         // 删除规则同时清缓存
         s.remove_forward(r.id);
         assert_eq!(s.resolved_ip(r.id), None);
+    }
+
+    #[test]
+    fn update_forward_keeps_identity_and_drops_stale_resolved() {
+        let mut s = temp_store();
+        let r = s.add_forward(fwd_req(80, "x.com", None), DeviceId::new(), Utc::now());
+        let ip: Ipv4Addr = "10.0.0.9".parse().unwrap();
+        s.set_resolved([(r.id, ip)].into());
+
+        // 只改端口：解析缓存保留
+        let u = s.update_forward(r.id, fwd_req(8080, "x.com", None)).unwrap();
+        assert_eq!((u.id, u.created_at, u.created_by), (r.id, r.created_at, r.created_by));
+        assert_eq!(u.listen, ipgate_proto::PortRange::single(8080));
+        assert_eq!(s.resolved_ip(r.id), Some(ip));
+        assert_eq!(s.forward_revision(), 2);
+
+        // 改目标：旧解析缓存作废
+        s.update_forward(r.id, fwd_req(8080, "y.com", None)).unwrap();
+        assert_eq!(s.forwards()[0].dest_host, "y.com");
+        assert_eq!(s.resolved_ip(r.id), None);
+
+        assert!(s.update_forward(ForwardId::new(), fwd_req(1, "z.com", None)).is_none());
     }
 
     #[test]

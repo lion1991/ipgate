@@ -64,6 +64,8 @@ pub enum RpcRequest {
     ListForwards,
     /// `POST /v1/forwards`
     AddForward(AddForwardRequest),
+    /// `PUT /v1/forwards/{id}`：原地修改一条 native 规则（id 与创建信息不变）→ [`crate::ForwardView`]。
+    UpdateForward { id: ForwardId, rule: AddForwardRequest },
     /// `DELETE /v1/forwards/{id}`
     RemoveForward(ForwardId),
     /// `DELETE /v1/forwards/dnat/{key}`
