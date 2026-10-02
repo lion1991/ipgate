@@ -2,15 +2,18 @@
 #
 # ipgate-agent 安装脚本（需 root）。
 #
-# 自动从 GitHub Releases 下载最新 agent 并安装；也可离线指定本地二进制。
+# 自动从 Releases（默认 GitHub，可换 wrlog 的 Forgejo）下载最新 agent 并安装；也可离线指定本地二进制。
 #
 #   # 一键（仓库已 public）：
 #   curl -fsSL https://raw.githubusercontent.com/lion1991/ipgate/main/agent/deploy/install.sh | sudo bash
+#   # 脚本与二进制都走 wrlog（GitHub 不通时）：
+#   curl -fsSL https://git.wrlog.cn/lion1991/ipgate/raw/branch/main/agent/deploy/install.sh | sudo bash -s -- --server https://git.wrlog.cn
 #
 #   # 或下载后运行：
-#   sudo ./install.sh [--version vX.Y.Z] [--repo owner/name] [--binary <path>] [--allow IP] [--yes]
+#   sudo ./install.sh [--version vX.Y.Z] [--server URL] [--repo owner/name] [--binary <path>] [--allow IP] [--yes]
 #
 #   --version   指定版本（默认 latest）
+#   --server    Release 所在站点（默认 https://github.com，或 $IPGATE_SERVER；如 https://git.wrlog.cn）
 #   --repo      指定仓库（默认 lion1991/ipgate，或 $IPGATE_REPO）
 #   --binary    用本地二进制，跳过下载（离线/整包安装）
 #   --allow     额外放行一个管理来源 IP（防自锁；可叠加在自动探测之上）
@@ -33,6 +36,7 @@ if [ -f "$0" ]; then
 else
   SCRIPT_DIR=""
 fi
+SERVER="${IPGATE_SERVER:-https://github.com}"
 REPO="${IPGATE_REPO:-lion1991/ipgate}"
 VERSION="${IPGATE_VERSION:-latest}"
 BIN_SRC=""
@@ -76,13 +80,14 @@ sha256_of() {
   else echo ""; fi
 }
 
-# 解析 latest 实际指向的 tag（走 releases/latest 的重定向，不耗 API 配额）。失败返回空。
+# 解析 latest 实际指向的 tag（走 releases/latest 的重定向，不耗 API 配额；GitHub 与 Forgejo 同构）。
+# 失败返回空。
 resolve_latest_tag() {
   if command -v curl >/dev/null 2>&1; then
     curl -fsSLI -o /dev/null -w '%{url_effective}\n' \
-      "https://github.com/$REPO/releases/latest" 2>/dev/null | sed -n 's#.*/releases/tag/##p'
+      "$SERVER/$REPO/releases/latest" 2>/dev/null | sed -n 's#.*/releases/tag/##p'
   else
-    wget -q -S -O /dev/null "https://github.com/$REPO/releases/latest" 2>&1 \
+    wget -q -S -O /dev/null "$SERVER/$REPO/releases/latest" 2>&1 \
       | sed -n 's#.*[Ll]ocation:.*/releases/tag/##p' | tail -n1
   fi
 }
@@ -220,6 +225,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --binary)  BIN_SRC="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
+    --server)  SERVER="${2%/}"; shift 2 ;;
     --repo)    REPO="$2"; shift 2 ;;
     --allow)   ALLOW_EXTRA="$2"; shift 2 ;;
     --force)   FORCE=1; shift ;;
@@ -239,18 +245,16 @@ case "$arch" in
 esac
 
 # --- 从 Releases 下载并校验 ---
-download_binary() {
-  [ -n "$ASSET" ] || die "暂不支持的架构: $arch（目前发布 x86_64）。可用 --binary 指定本地二进制。"
-  local base
-  if [ "$VERSION" = latest ]; then
-    base="https://github.com/$REPO/releases/latest/download"
-  else
-    base="https://github.com/$REPO/releases/download/$VERSION"
-  fi
+# 按具体 tag 下载：Forgejo 没有 GitHub 的 releases/latest/download 直链，latest 须先解析成 tag。
+download_binary() { # <tag>
+  [ -n "$ASSET" ] || die "暂不支持的架构: ${arch}（目前发布 x86_64）。可用 --binary 指定本地二进制。"
+  local tag="$1"
+  [ -n "$tag" ] || die "解析不到最新版本（$SERVER/$REPO/releases/latest）。检查网络，或用 --version vX.Y.Z 指定。"
+  local base="$SERVER/$REPO/releases/download/$tag"
   TMP_BIN="$(mktemp)"
-  log "下载 $ASSET（$VERSION）<- $REPO"
+  log "下载 ${ASSET}（${tag}）<- $SERVER/$REPO"
   fetch "$base/$ASSET" "$TMP_BIN" \
-    || die "下载失败。检查：仓库是否 public、版本 $VERSION 是否存在、网络是否可达 github.com。"
+    || die "下载失败。检查：仓库是否 public、版本 $tag 是否存在、网络是否可达 ${SERVER}。"
   [ -s "$TMP_BIN" ] || die "下载到空文件。"
 
   # SHA256 校验（尽力而为）。
@@ -311,7 +315,7 @@ if [ -z "$BIN_SRC" ]; then
   else
     log "未安装 → 安装 ${target:-latest}。"
   fi
-  download_binary
+  download_binary "$target"
 fi
 [ -n "$BIN_SRC" ] && [ -f "$BIN_SRC" ] || die "找不到也下载不到 ipgate-agent 二进制。"
 
