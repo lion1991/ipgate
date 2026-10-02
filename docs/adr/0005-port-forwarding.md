@@ -53,6 +53,8 @@ chain forward     { type filter hook forward  priority 0;    policy accept;
 
 ```
 GET/POST /v1/forwards        列出 / 新增（需 Bearer）
+PUT      /v1/forwards/{id}   原地修改（0.2.7+，RPC op `update_forward`）：保留 id 与创建信息；
+                             与其它 native 规则 (有效网卡, 监听端口) 重叠则拒；目标变更时清该条解析缓存
 DELETE   /v1/forwards/{id}   删除（需 Bearer）
 GET      /v1/interfaces      列网卡（客户端下拉/源 IP 提示，需 Bearer）
 

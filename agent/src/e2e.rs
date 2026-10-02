@@ -301,6 +301,62 @@ async fn forward_crud_flow() {
 }
 
 #[tokio::test]
+async fn forward_update_flow() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("x".into()) },
+    )
+    .await
+    .unwrap();
+
+    let req = |listen: u16, dest: &str, note: &str| AddForwardRequest {
+        proto: ForwardProto::Tcp,
+        iface: Some("eth0".into()),
+        listen: PortRange::single(listen),
+        dest_host: dest.into(),
+        dest_port: PortRange::single(8443),
+        source: ForwardSource::Auto,
+        note: note.into(),
+    };
+    let a: ForwardView = cli.ok(RpcRequest::AddForward(req(443, "10.0.0.9", "web"))).await;
+    let b: ForwardView = cli.ok(RpcRequest::AddForward(req(80, "10.0.0.9", ""))).await;
+
+    // 原地修改：id 不变，字段更新
+    let edited: ForwardView = cli
+        .ok(RpcRequest::UpdateForward { id: a.rule.id, rule: req(8443, "10.0.0.10", "web2") })
+        .await;
+    assert_eq!(edited.rule.id, a.rule.id);
+    assert_eq!(edited.rule.created_at, a.rule.created_at);
+    let list: UnifiedForwardList = cli.ok(RpcRequest::ListForwards).await;
+    assert_eq!(list.forwards.len(), 2);
+    assert_eq!(list.revision, 3);
+    let row = list.forwards.iter().find(|f| f.id == Some(a.rule.id)).unwrap();
+    assert_eq!((row.listen, row.dest_host.as_str(), row.note.as_str()), (PortRange::single(8443), "10.0.0.10", "web2"));
+
+    // 改到另一条已占用的端口 → Conflict，原规则不动
+    match cli.rpc(RpcRequest::UpdateForward { id: a.rule.id, rule: req(80, "10.0.0.10", "") }).await {
+        RpcResponse::Err(e) => assert_eq!(e.code, ErrorCode::Conflict),
+        RpcResponse::Ok(_) => panic!("应 Conflict"),
+    }
+    // 不存在 → NotFound；非法入参 → BadRequest
+    match cli.rpc(RpcRequest::UpdateForward { id: ForwardId::new(), rule: req(9000, "10.0.0.9", "") }).await {
+        RpcResponse::Err(e) => assert_eq!(e.code, ErrorCode::NotFound),
+        RpcResponse::Ok(_) => panic!("应 NotFound"),
+    }
+    match cli.rpc(RpcRequest::UpdateForward { id: b.rule.id, rule: req(80, "127.0.0.1", "") }).await {
+        RpcResponse::Err(e) => assert_eq!(e.code, ErrorCode::BadRequest),
+        RpcResponse::Ok(_) => panic!("应 BadRequest"),
+    }
+    let list: UnifiedForwardList = cli.ok(RpcRequest::ListForwards).await;
+    assert_eq!(list.revision, 3);
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+#[tokio::test]
 async fn ssh_exposure_toggle_flow() {
     let srv = spawn().await;
     let (priv_, _) = gen_device();
