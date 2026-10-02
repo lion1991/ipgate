@@ -45,8 +45,8 @@ if confirm "执行 flush?"; then
   log "已 flush。"
 fi
 
-rm -f "$PREFIX/ipgate-agent"
-log "已删除二进制。"
+rm -f "$PREFIX/ipgate-agent" "$PREFIX/ipgate-update"
+log "已删除二进制与 ipgate-update。"
 
 # 移除安装时写入的「仅转发」SSH 隧道公钥（标记 ipgate-tunnel，ADR 0007）。趁 config 还在先读 ssh_user。
 suser="$(grep -o '"ssh_user"[^,]*' "$CONF_DIR/config.json" 2>/dev/null | sed 's/.*: *"//; s/".*//')"

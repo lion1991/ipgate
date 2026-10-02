@@ -92,6 +92,37 @@ resolve_latest_tag() {
   fi
 }
 
+# 写入 ipgate-update：记住本次的下载源，之后在服务器上敲 `ipgate-update` 即原地升级，不必再记整条命令。
+# 与 install_unit 一样在「无更新」路径也调用，老部署重跑一次脚本就能拿到它。
+install_updater() {
+  local url
+  case "$SERVER" in
+    https://github.com) url="https://raw.githubusercontent.com/$REPO/main/agent/deploy/install.sh" ;;
+    *)                  url="$SERVER/$REPO/raw/branch/main/agent/deploy/install.sh" ;;
+  esac
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# 由 ipgate install.sh 生成：从 %s 拉最新安装脚本并原地升级（配置 / 名单 / 已配对设备保留）。\n' "$SERVER/$REPO"
+    printf '# 参数原样透传给 install.sh，如 --force、--version vX.Y.Z、-y。\n'
+    printf 'SERVER=%q\nREPO=%q\nURL=%q\n' "$SERVER" "$REPO" "$url"
+    cat <<'UPDATER'
+set -euo pipefail
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+dir="$(mktemp -d)"
+trap 'rm -rf "$dir"' EXIT
+# 先完整下载再执行：curl | bash 断流时会执行半截脚本。放进空目录，免得 install.sh 把同目录的杂项当成本地二进制。
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL "$URL" -o "$dir/install.sh"
+else
+  wget -qO "$dir/install.sh" "$URL"
+fi
+bash "$dir/install.sh" --server "$SERVER" --repo "$REPO" "$@"
+UPDATER
+  } > "$PREFIX/ipgate-update"
+  chmod 0755 "$PREFIX/ipgate-update"
+  log "已安装 ipgate-update：之后在本机运行它即可升级（来源 ${SERVER}）。"
+}
+
 # 写入/刷新 systemd unit（同目录有 .service 用之，否则内置一份）+ daemon-reload。
 # 单独成函数：全新装/升级/「二进制无更新」三条路径都要调它，确保 deploy-only 的 unit 改动
 # （如 ReadWritePaths）即便二进制同版本也能落地——否则会被「无更新跳过」永久漏掉。
@@ -225,7 +256,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --binary)  BIN_SRC="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
-    --server)  SERVER="${2%/}"; shift 2 ;;
+    --server)  SERVER="$2"; shift 2 ;;
     --repo)    REPO="$2"; shift 2 ;;
     --allow)   ALLOW_EXTRA="$2"; shift 2 ;;
     --force)   FORCE=1; shift ;;
@@ -233,6 +264,7 @@ while [ $# -gt 0 ]; do
     *) die "未知参数: $1" ;;
   esac
 done
+SERVER="${SERVER%/}"
 
 [ "$(id -u)" = 0 ] || die "请用 root 运行（sudo）。"
 
@@ -306,6 +338,7 @@ if [ -z "$BIN_SRC" ]; then
     # 二进制无更新 ≠ 不刷新部署：unit 可能有 deploy-only 改动（如 ReadWritePaths），仍重写并
     # 重启使其生效（daemon-reload 不会重启已在跑的实例，故必须 restart 而非仅 is-active 兜底）。
     install_unit
+    install_updater
     systemctl enable ipgate-agent.service >/dev/null 2>&1 || true
     systemctl restart ipgate-agent.service 2>/dev/null || true
     exit 0
@@ -410,8 +443,9 @@ fi
 warn "SSH 端口 $eff_ssh_port 已由 ruleset 无条件放行，default-drop 不会锁死 SSH。"
 warn "若本机对外提供 Web 等服务，务必把 80/443 写进 config.json 的 public_tcp！"
 
-# --- 安装 systemd unit ---
+# --- 安装 systemd unit + 升级命令 ---
 install_unit
+install_updater
 systemctl enable ipgate-agent.service >/dev/null 2>&1 || true
 # 用 restart 而非 enable --now：无论之前是否在跑，都拉起新二进制 —— 重复运行脚本 = 原地升级。
 systemctl restart ipgate-agent.service
@@ -440,4 +474,4 @@ else
   log "（随时重印访问密钥: ipgate-agent access-key；重置: ipgate-agent access-key --reset 后 restart）"
 fi
 echo
-log "完成。校验 ruleset: nft list table inet ipgate"
+log "完成。校验 ruleset: nft list table inet ipgate；以后升级: ipgate-update"

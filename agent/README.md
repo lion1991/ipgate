@@ -63,6 +63,8 @@ sudo deploy/uninstall.sh --purge # 停服务 + flush 表 + 删数据
 > 构建并发布同名资产的 release：GitHub 走 `.github/workflows/`，Forgejo 走 `.forgejo/workflows/`（runner
 > 标签 `go`；有了它 Forgejo 就不再读 `.github/`）。Forgejo 的 release 也可在 Actions 页手动运行补发旧 tag。
 > `install.sh` 默认从 GitHub 下载；`--server https://git.wrlog.cn`（或 `IPGATE_SERVER`）改走 wrlog。
+> 装完会生成 `/usr/local/bin/ipgate-update`（记住本次来源），之后在服务器上 `ipgate-update` 即原地升级，
+> 参数透传给 install.sh（如 `--force`、`--version vX.Y.Z`、`-y`）。
 
 > ⚠️ default-drop 一旦生效，除 **SSH 端口（`ssh_port`，默认 22，无条件放行）**/established/放行名单/公开端口外一律拒。SSH 是唯一入口、结构性**不自锁**（ADR 0007）；其余对外服务端口请写进 `public_tcp`。
 >
