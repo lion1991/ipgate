@@ -12,6 +12,7 @@ use crate::util::{random_bytes, to_hex};
 use chrono::Utc;
 use ipgate_proto::*;
 use ipnet::IpNet;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -19,11 +20,24 @@ use tokio::net::{TcpListener, TcpStream};
 #[derive(Default)]
 struct MockNft {
     set: Mutex<Vec<IpNet>>,
+    /// 最近一次整表 apply 的配置（断言开关是否真的落到「内核」）。
+    applied_cfg: Mutex<Option<RulesetConfig>>,
+    /// 模拟老内核/老 nft 不认转发名单门的表达式。
+    reject_gate: std::sync::atomic::AtomicBool,
+    /// 模拟与门无关的 nft 故障：任何整表 apply 都失败（内核保持旧表）。
+    fail_apply: std::sync::atomic::AtomicBool,
 }
 
 impl NftBackend for MockNft {
-    fn apply(&self, _cfg: &RulesetConfig, entries: &[Entry]) -> anyhow::Result<()> {
+    fn apply(&self, cfg: &RulesetConfig, entries: &[Entry]) -> anyhow::Result<()> {
+        if self.fail_apply.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("Error: Could not process rule: No buffer space available");
+        }
+        if cfg.forward_allowlist_only && self.reject_gate.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("Error: syntax error, unexpected status");
+        }
         *self.set.lock().unwrap() = entries.iter().map(|e| e.target).collect();
+        *self.applied_cfg.lock().unwrap() = Some(cfg.clone());
         Ok(())
     }
     fn add(&self, entry: &Entry) -> anyhow::Result<()> {
@@ -91,6 +105,7 @@ async fn spawn() -> Server {
         nat: Arc::new(MockNat::default()),
         dnat: Arc::new(crate::dnat::DnatAdapter::new(crate::dnat::DnatAdapterConfig::default())),
         rate: Arc::new(RateLimiter::new(120, std::time::Duration::from_secs(60))),
+        forward_gate_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -397,6 +412,152 @@ async fn ssh_exposure_toggle_flow() {
     // 关回开放（任何时候都允许，不受名单约束）。
     let s: AgentSettings = cli.ok(RpcRequest::SetSshExposure { allowlist_only: false }).await;
     assert!(!s.ssh_allowlist_only);
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+fn applied_gate(srv: &Server) -> bool {
+    srv.backend.applied_cfg.lock().unwrap().as_ref().unwrap().forward_allowlist_only
+}
+
+#[tokio::test]
+async fn forward_exposure_toggle_flow() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("x".into()) },
+    )
+    .await
+    .unwrap();
+
+    // 默认：门关（转发对全网开放）。
+    let s: AgentSettings = cli.ok(RpcRequest::GetSettings).await;
+    assert_eq!(s.forward_allowlist_only, Some(false));
+    assert_eq!(s.forward_gate_active, Some(false));
+
+    // 开门：名单为空也允许（管理走 SSH input 链，不会自锁）。
+    let s: AgentSettings = cli.ok(RpcRequest::SetForwardExposure { allowlist_only: true }).await;
+    assert_eq!(s.forward_allowlist_only, Some(true));
+    assert_eq!(s.forward_gate_active, Some(true));
+    assert!(applied_gate(&srv));
+
+    // 切 SSH 暴露会整表重建：门必须随之保留，不能被冲掉。
+    let _: Entry = cli
+        .ok(RpcRequest::Allow(AllowRequest {
+            target: "203.0.113.7/32".parse().unwrap(),
+            note: "me".into(),
+            expires_at: None,
+        }))
+        .await;
+    let _: AgentSettings = cli.ok(RpcRequest::SetSshExposure { allowlist_only: true }).await;
+    assert!(applied_gate(&srv));
+
+    // 关门。
+    let s: AgentSettings = cli.ok(RpcRequest::SetForwardExposure { allowlist_only: false }).await;
+    assert_eq!(s.forward_allowlist_only, Some(false));
+    assert_eq!(s.forward_gate_active, Some(false));
+    assert!(!applied_gate(&srv));
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+#[tokio::test]
+async fn forward_exposure_rejected_when_kernel_lacks_support() {
+    let srv = spawn().await;
+    srv.backend.reject_gate.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("x".into()) },
+    )
+    .await
+    .unwrap();
+
+    let e = expect_nft_failure(&mut cli, RpcRequest::SetForwardExposure { allowlist_only: true }).await;
+    assert!(e.contains("syntax error"), "应附上 nft 原始错误，便于区分「不支持」与临时故障：{e}");
+    // 失败不落盘：设置仍是关，「内核」仍是无门 ruleset。
+    let s: AgentSettings = cli.ok(RpcRequest::GetSettings).await;
+    assert_eq!(s.forward_allowlist_only, Some(false));
+    assert_eq!(s.forward_gate_active, Some(false));
+    assert!(!applied_gate(&srv));
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+async fn expect_nft_failure(cli: &mut Client, req: RpcRequest) -> String {
+    match cli.rpc(req).await {
+        RpcResponse::Err(e) => {
+            assert_eq!(e.code, ErrorCode::NftFailure);
+            e.message
+        }
+        RpcResponse::Ok(v) => panic!("期望 NftFailure，得到 Ok：{v}"),
+    }
+}
+
+/// nft 整表 apply 失败（与门无关）时内核保持旧表，开关也不能落盘——否则「设置」与内核分叉，
+/// 且下次重启才突然生效。开、关两个方向都要成立。
+#[tokio::test]
+async fn forward_exposure_apply_failure_leaves_setting_unchanged() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("x".into()) },
+    )
+    .await
+    .unwrap();
+    let off = Ordering::SeqCst;
+
+    srv.backend.fail_apply.store(true, off);
+    expect_nft_failure(&mut cli, RpcRequest::SetForwardExposure { allowlist_only: true }).await;
+    let s: AgentSettings = cli.ok(RpcRequest::GetSettings).await;
+    assert_eq!((s.forward_allowlist_only, s.forward_gate_active), (Some(false), Some(false)));
+
+    srv.backend.fail_apply.store(false, off);
+    let _: AgentSettings = cli.ok(RpcRequest::SetForwardExposure { allowlist_only: true }).await;
+    srv.backend.fail_apply.store(true, off);
+    expect_nft_failure(&mut cli, RpcRequest::SetForwardExposure { allowlist_only: false }).await;
+    let s: AgentSettings = cli.ok(RpcRequest::GetSettings).await;
+    assert_eq!((s.forward_allowlist_only, s.forward_gate_active), (Some(true), Some(true)));
+    assert!(applied_gate(&srv), "关门失败时内核仍带门，设置不能显示为已关");
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+/// 门曾生效、后因内核不再支持而回退（意图开、实际未生效）：重试开启仍失败时保留意图，
+/// 客户端继续显示「已开启但未生效」；内核恢复支持后重试即生效。
+#[tokio::test]
+async fn forward_gate_retry_keeps_intent_until_kernel_accepts() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("x".into()) },
+    )
+    .await
+    .unwrap();
+    let off = Ordering::SeqCst;
+
+    let _: AgentSettings = cli.ok(RpcRequest::SetForwardExposure { allowlist_only: true }).await;
+    srv.backend.reject_gate.store(true, off);
+    // 任意整表重建（这里是切 SSH 暴露）遇到门被拒 → 退回无门，SSH 开关照常生效。
+    let s: AgentSettings = cli.ok(RpcRequest::SetSshExposure { allowlist_only: false }).await;
+    assert_eq!((s.forward_allowlist_only, s.forward_gate_active), (Some(true), Some(false)));
+
+    expect_nft_failure(&mut cli, RpcRequest::SetForwardExposure { allowlist_only: true }).await;
+    let s: AgentSettings = cli.ok(RpcRequest::GetSettings).await;
+    assert_eq!((s.forward_allowlist_only, s.forward_gate_active), (Some(true), Some(false)));
+    assert!(!applied_gate(&srv));
+
+    srv.backend.reject_gate.store(false, off);
+    let s: AgentSettings = cli.ok(RpcRequest::SetForwardExposure { allowlist_only: true }).await;
+    assert_eq!((s.forward_allowlist_only, s.forward_gate_active), (Some(true), Some(true)));
+    assert!(applied_gate(&srv));
 
     let _ = std::fs::remove_dir_all(&srv.data_dir);
 }

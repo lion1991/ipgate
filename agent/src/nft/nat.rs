@@ -80,8 +80,8 @@ pub fn render_nat_apply(forwards: &[ResolvedForward]) -> String {
     }
     s.push_str("    }\n");
 
-    // forward：放行被转发流量。policy accept（多数 VPS 默认即转发可达）；
-    // 显式 accept 一是表意，二是日后做「只放名单内源 IP」时的挂点（改 policy drop + saddr 匹配）。
+    // forward：放行被转发流量。policy accept（多数 VPS 默认即转发可达），显式 accept 仅表意。
+    // 「只放名单内源 IP」的门在 `inet ipgate` 的 forward 链（ADR 0008），不在本表。
     s.push_str("    chain forward {\n");
     s.push_str("        type filter hook forward priority 0; policy accept;\n");
     s.push_str("        ct state established,related accept\n");

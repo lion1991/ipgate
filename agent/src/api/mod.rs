@@ -21,6 +21,7 @@ use ipgate_proto::{
     RpcResponse,
 };
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -89,6 +90,8 @@ pub struct AppState {
     pub dnat: Arc<DnatAdapter>,
     /// per-IP 限流器。loopback+SSH 模型下主要给（未来的）直连兜底。
     pub rate: Arc<RateLimiter>,
+    /// 转发名单门是否实际生效（ADR 0008）；每次整表 apply 后回写，对账线程共享。
+    pub forward_gate_active: Arc<AtomicBool>,
 }
 
 /// 启动 Noise JSON-RPC 服务（loopback only，阻塞直到出错）。
@@ -287,6 +290,11 @@ fn dispatch(st: &AppState, device: DeviceId, peer_ip: IpAddr, req: RpcRequest) -
         GetSettings => to_val(handlers::get_settings(st)),
         SetSshExposure { allowlist_only } => {
             to_val(handlers::set_ssh_exposure(st, allowlist_only)?)
+        }
+        SetForwardExposure { allowlist_only } => {
+            // 审计：收/放转发会影响本机所有对外转发与 Docker 映射端口的可达性。
+            tracing::warn!(%device, allowlist_only, "特权操作：设置转发名单门");
+            to_val(handlers::set_forward_exposure(st, allowlist_only)?)
         }
         SetSshPasswordAuth { enabled } => {
             // 审计：改全机 SSH 密码登录是高权操作，记下是哪台设备发起的（P1 修复：原先无痕）。

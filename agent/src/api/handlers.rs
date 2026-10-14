@@ -6,8 +6,9 @@
 
 use super::error::{internal, ApiResult};
 use super::AppState;
+use crate::nft::Gate;
 use crate::reconcile;
-use crate::store::LockExt;
+use crate::store::{LockExt, RulesetFlags};
 use chrono::Utc;
 use ipgate_proto::{
     validate_ports, AddForwardRequest, AgentSettings, AllowRequest, Allowlist, ApiError, Device,
@@ -16,6 +17,7 @@ use ipgate_proto::{
     WhoamiResponse,
 };
 use std::net::IpAddr;
+use std::sync::atomic::Ordering;
 
 // ---- 放行名单 ----
 
@@ -83,24 +85,37 @@ pub fn sync(st: &AppState) -> ApiResult<Diff> {
     Ok(reconcile::diff(store.entries(), &kernel, now))
 }
 
-// ---- agent 设置（SSH 端口暴露模式）----
+// ---- agent 设置（SSH 端口暴露模式 / 转发名单门）----
 
-/// 组装 [`AgentSettings`]：运行期 SSH 暴露态 + 静态端口 + best-effort 的 sshd 认证态势。
+/// 组装 [`AgentSettings`]：运行期开关 + 静态端口 + best-effort 的 sshd 认证态势。
 /// `sshd -T` 探测失败（无 root/无 sshd）时各认证项为 `None`，不影响其余字段。
-fn build_settings(st: &AppState, ssh_allowlist_only: bool) -> AgentSettings {
+fn build_settings(st: &AppState) -> AgentSettings {
+    let flags = st.store.lock_safe().ruleset_flags();
     let auth = crate::sshd::probe();
     AgentSettings {
-        ssh_allowlist_only,
+        ssh_allowlist_only: flags.ssh_allowlist_only,
         ssh_port: st.cfg.ssh_port,
         ssh_password_auth: auth.password,
         ssh_kbd_interactive_auth: auth.kbd_interactive,
         ssh_permit_root_login: auth.permit_root,
+        forward_allowlist_only: Some(flags.forward_allowlist_only),
+        forward_gate_active: Some(st.forward_gate_active.load(Ordering::SeqCst)),
     }
 }
 
 pub fn get_settings(st: &AppState) -> AgentSettings {
-    let allowlist_only = st.store.lock_safe().ssh_allowlist_only();
-    build_settings(st, allowlist_only)
+    build_settings(st)
+}
+
+/// 按给定开关整表重建 ruleset，并回写门的实际生效态。
+///
+/// 调用方须持 store 锁直到开关落盘：整表重建因此与对账兜底重建、另一开关串行，
+/// 不会有人拿过期的开关把刚落地的 ruleset 覆盖掉。
+fn reapply_ruleset(st: &AppState, flags: RulesetFlags, entries: &[Entry]) -> ApiResult<Gate> {
+    let gate = crate::nft::apply_ruleset(&*st.backend, &st.cfg.ruleset_with(flags), entries)
+        .map_err(|e| ApiError::new(ErrorCode::NftFailure, e.to_string()))?;
+    st.forward_gate_active.store(gate.active(), Ordering::SeqCst);
+    Ok(gate)
 }
 
 /// 切换 SSH 端口暴露模式并整表重建 ruleset。
@@ -110,7 +125,7 @@ pub fn get_settings(st: &AppState) -> AgentSettings {
 /// 在调用前核对「当前外网 IP ∈ 名单」兜底（agent 经隧道只见 loopback，无法自证）。
 pub fn set_ssh_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<AgentSettings> {
     let now = Utc::now();
-    let entries = {
+    {
         let mut store = st.store.lock_safe();
         if allowlist_only {
             let live = store.entries().iter().filter(|e| !e.is_expired(now)).count();
@@ -121,16 +136,39 @@ pub fn set_ssh_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<AgentS
                 ));
             }
         }
+        // SSH 暴露是 input 链结构变更（非 set 元素）：必须整表原子重建。对账循环只增删 set 元素、
+        // 不重渲染链，故此变更落地后不会被它 revert（仅 list() 失败时的兜底重建会读 store 同步本值）。
+        // 先落内核再落盘：apply 失败时内核仍是旧表，设置也不变。
+        let flags = RulesetFlags { ssh_allowlist_only: allowlist_only, ..store.ruleset_flags() };
+        reapply_ruleset(st, flags, store.entries())?;
         store.set_ssh_allowlist_only(allowlist_only);
         store.save().map_err(internal)?;
-        store.entries().to_vec()
-    };
-    // SSH 暴露是 input 链结构变更（非 set 元素）：必须整表原子重建。对账循环只增删 set 元素、
-    // 不重渲染链，故此变更落地后不会被它 revert（仅 list() 失败时的兜底重建会读 store 同步本值）。
-    st.backend
-        .apply(&st.cfg.ruleset_with(allowlist_only), &entries)
-        .map_err(|e| ApiError::new(ErrorCode::NftFailure, e.to_string()))?;
-    Ok(build_settings(st, allowlist_only))
+    }
+    Ok(build_settings(st))
+}
+
+/// 切换转发名单门（ADR 0008）并整表重建 ruleset。
+///
+/// 名单为空也允许开启：门只在 forward hook，管理入口走 input 链的 SSH，不会自锁。
+///
+/// 先落内核再落盘，任何失败都不改设置：apply 失败时内核仍是旧表；门被拒时内核已退回无门，
+/// 原本关着的仍是关，原本开着但未生效的（重试）继续显示「未生效」。
+pub fn set_forward_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<AgentSettings> {
+    {
+        let mut store = st.store.lock_safe();
+        let flags = RulesetFlags { forward_allowlist_only: allowlist_only, ..store.ruleset_flags() };
+        if let Gate::Rejected(e) = reapply_ruleset(st, flags, store.entries())? {
+            return Err(ApiError::new(
+                ErrorCode::NftFailure,
+                format!(
+                    "转发名单门加载失败，转发保持对全网开放（常见原因：内核/nft 不支持 ct status / ct original 匹配）：{e:#}"
+                ),
+            ));
+        }
+        store.set_forward_allowlist_only(allowlist_only);
+        store.save().map_err(internal)?;
+    }
+    Ok(build_settings(st))
 }
 
 /// 开/关系统 sshd 的密码登录（改 sshd_config + reload），返回刷新后的设置。
@@ -138,8 +176,7 @@ pub fn set_ssh_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<AgentS
 pub fn set_ssh_password_auth(st: &AppState, enabled: bool) -> ApiResult<AgentSettings> {
     crate::sshd::set_password_auth(enabled)
         .map_err(|e| ApiError::new(ErrorCode::Internal, format!("{e:#}")))?;
-    let allowlist_only = st.store.lock_safe().ssh_allowlist_only();
-    Ok(build_settings(st, allowlist_only))
+    Ok(build_settings(st))
 }
 
 /// 重置 root 密码。明文经 Noise 隧道送达，此处不落盘、不记日志，直接交 chpasswd。

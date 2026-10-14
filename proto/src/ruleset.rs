@@ -18,6 +18,10 @@ pub struct RulesetConfig {
     /// 只能从 VPS 控制台用 `ipgate-agent ssh-expose --open` 恢复。开启前务必先放行自己。
     #[serde(default)]
     pub ssh_allowlist_only: bool,
+    /// 转发名单门（ADR 0008）：被 DNAT 进来的新建连接（native 转发 / dnat 工具 / Docker `-p`）
+    /// 是否也仅放行名单内源 IP 与公开端口。默认 false = 不接管 forward hook，转发对全网开放。
+    #[serde(default)]
+    pub forward_allowlist_only: bool,
     /// 对全世界开放的 TCP 端口/区间（默认空）。
     #[serde(default)]
     pub public_tcp: Vec<PortRange>,
@@ -31,6 +35,7 @@ impl Default for RulesetConfig {
         Self {
             ssh_port: crate::DEFAULT_SSH_PORT,
             ssh_allowlist_only: false,
+            forward_allowlist_only: false,
             public_tcp: Vec::new(),
             public_udp: Vec::new(),
         }

@@ -85,6 +85,7 @@ dnat daemon 每 60s 从 `conf` 重建 `dnat_utils` 并自解析域名。ipgate �
 - **一台机一个权威落地者**：过渡期两表并存但 native 优先级更低让 dnat 赢；严禁两者都「权威新增」同端口。
 - **公开/私有边界不破**：ipgate（公开 agent 仓）只**运行期读写 dnat 文件 + 调其二进制**，非代码依赖；dnat 仍是独立私有工具。但其 conf/state 格式是外部契约，须文档化 + 钉版本，dnat 改格式要回看本 ADR 与 `dnat/conf.rs`。
 - **dnat 不在则降级**：`DnatAdapter::present()`（二进制 + conf 目录在）为假时，适配器静默不参与，native 照常。默认 `enabled=false`。
+- **转发名单门同样约束 dnat**（ADR 0008）：门按 `ct status dnat` 匹配，与 DNAT 发生在哪张表无关，所以 `dnat_utils` 的转发和 native 一样受名单约束。ipgate 依旧不写 dnat 表。
 
 ## 实现落点（已落地）
 

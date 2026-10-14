@@ -40,7 +40,7 @@ chain forward     { type filter hook forward  priority 0;    policy accept;
   iifname "eth0" ip daddr 1.2.3.4 tcp dport 8443 ct state new accept }
 ```
 
-优先级用**数字**（-100/100/0）而非 `dstnat`/`srcnat` 命名 —— 命名优先级要 nft 0.9+，数字在 el7 的 0.8 也认（与放行名单表口径一致）。`forward` 链 policy accept；显式 accept 既表意，也作为日后「只放名单内源 IP」的挂点。
+优先级用**数字**（-100/100/0）而非 `dstnat`/`srcnat` 命名 —— 命名优先级要 nft 0.9+，数字在 el7 的 0.8 也认（与放行名单表口径一致）。`forward` 链 policy accept；显式 accept 仅作表意（「只放名单内源 IP」的门不放在这里，见 ADR 0008）。
 
 ### 解析 / 落地编排（`forward.rs`）
 
@@ -65,9 +65,9 @@ ipgate-agent forwards | forward-add | forward-rm    离线/装机/排障（同 a
 
 ## 安全注记
 
-- **转发端口天然对全网开放**：流量走 forward hook，**不过** `inet ipgate` 的 INPUT 名单。这是端口转发的标准语义。
-- **「只放名单内源 IP」推后（Phase 2）**：要在 `ip ipgate_nat` 里同步一份名单副本（跨表 set 不可引用），有复杂度。v1 先做标准转发，挂点已在 `forward` 链留好。
+- **转发端口默认对全网开放**：流量走 forward hook，**不过** `inet ipgate` 的 INPUT 名单。这是端口转发的标准语义。
+- **「只放名单内源 IP」已由 ADR 0008 实现**：可选的转发名单门挂在 `inet ipgate` 表的 forward 链上，直接引用同表的名单 set，不需要在 `ip ipgate_nat` 里复制名单。它按 `ct status dnat` 匹配，所以 native、dnat 工具和 Docker 映射都受约束。
 
 ## v1 范围
 
-IPv4；单端口 + 等长区间 + 区间→单端口；TCP/UDP/Both；IP 与域名目标。IPv6、名单门绑定、mTLS 纵深留后续。
+IPv4；单端口 + 等长区间 + 区间→单端口；TCP/UDP/Both；IP 与域名目标。IPv6、mTLS 纵深留后续（名单门见 ADR 0008）。

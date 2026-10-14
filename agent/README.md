@@ -28,7 +28,7 @@
 | `noise` | `NoiseIdentity`（X25519 静态密钥，0600 持久化）+ `Noise_IKpsk0` 握手（responder）+ 长度前缀分帧 AEAD 收发 + `derive_psk`（access key→PSK） |
 | `auth` | `pairing`（配对码，文件跨进程、单次限时）/ `access`（访问密钥 = Noise PSK 来源） |
 | `api` | loopback TCP 监听 + `serve`/握手鉴权（含配对）+ **JSON-RPC dispatcher**（`RpcRequest`→handler）+ per-IP 限流 |
-| `main` | CLI：`run`（守护进程）/ `pair [--qr --host]` / `access-key` / `forwards` / `forward-add` / `forward-rm` / `ssh-expose` / `print-ruleset` / `status` / `uninstall` |
+| `main` | CLI：`run`（守护进程）/ `pair [--qr --host]` / `access-key` / `forwards` / `forward-add` / `forward-rm` / `ssh-expose` / `forward-expose` / `print-ruleset` / `status` / `uninstall` |
 
 ## CLI
 
@@ -43,6 +43,9 @@ ipgate-agent --config <path> forward-add --listen 443 --dest 10.0.0.9:8443 [--pr
 ipgate-agent --config <path> forward-rm <id> # 删端口转发（按 id）
 ipgate-agent --config <path> ssh-expose --open       # SSH 端口对所有人开放（控制台救援：解除「仅名单」自锁）
 ipgate-agent --config <path> ssh-expose --allowlist  # SSH 端口仅放行名单内源 IP 可连
+ipgate-agent --config <path> forward-expose --allowlist  # 转发（含 Docker 映射）仅放行名单内源 IP 与公开端口（ADR 0008）
+ipgate-agent --config <path> forward-expose --open       # 转发对所有人开放（控制台救援）
+# ssh-expose / forward-expose 成功后，若服务在运行会自动 systemctl restart，免得服务内存里的旧开关把改动撤销
 ipgate-agent --config <path> print-ruleset   # 打印将应用的 nft ruleset（不改内核，便于审计）
 ipgate-agent status                          # 存储条目 + 内核 set 状态
 ipgate-agent uninstall                       # flush 掉 inet ipgate 表
@@ -69,6 +72,8 @@ sudo deploy/uninstall.sh --purge # 停服务 + flush 表 + 删数据
 > ⚠️ default-drop 一旦生效，除 **SSH 端口（`ssh_port`，默认 22，无条件放行）**/established/放行名单/公开端口外一律拒。SSH 是唯一入口、结构性**不自锁**（ADR 0007）；其余对外服务端口请写进 `public_tcp`。
 >
 > 🔒 **SSH 仅名单可连**（可选，默认关）：客户端开关或 `ssh-expose --allowlist` 可把 22 收窄为仅放行名单内源 IP 可连（去掉无条件放行，改由 `saddr @allow` 命中）。有自锁风险——开启前先放行自己；锁死了从控制台 `ssh-expose --open` 恢复。状态存 `state.json`（`ssh_allowlist_only`）。
+>
+> 🚪 **转发名单门**（可选；代码默认关，install.sh 全新安装时开启，ADR 0008）：被 DNAT 进来的新建连接（ipgate 转发、dnat 工具、Docker `-p`）也只放行名单内源 IP 与 `public_tcp/udp`（按 DNAT 前的原端口）。不经 input，不会自锁。内核不支持时自动退回无门 ruleset，并上报未生效。状态存 `state.json`（`forward_allowlist_only`）。
 
 ## API（JSON-RPC over Noise，仅 loopback；经 SSH 隧道访问，ADR 0007）
 
@@ -91,19 +96,20 @@ RPC op（握手后，隧道内 JSON）：
   remove_dnat / migrate_dnat                dnat 适配（ADR 0006）
   list_interfaces                           列主机网卡（客户端下拉用）
   list_devices / revoke_device              已授权设备 / 吊销
-  get_settings / set_ssh_exposure           读取设置（SSH 暴露模式 + 端口 + sshd 密码登录态势）/ 切换 SSH 端口暴露（仅名单↔对所有人）
+  get_settings / set_ssh_exposure           读取设置（SSH 暴露模式 + 端口 + sshd 密码登录态势 + 转发门意图/生效态）/ 切换 SSH 端口暴露（仅名单↔对所有人）
+  set_forward_exposure                      切换转发名单门（ADR 0008；先落内核再落盘，失败不改设置，错误附 nft 原文）
   set_ssh_password_auth / reset_root_password 开/关 sshd 密码登录（主配置顶部受管块+reload，sshd -t 校验，失败回滚）/ 重置 root 密码（chpasswd）
   whoami                                    回报对端 IP（注：SSH 隧道下为 loopback）
 ```
 
 > **端口转发**（ADR 0005）：DNAT/SNAT 落在**独立** `ip ipgate_nat` 表，与放行名单 `inet ipgate`
 > 彻底隔离——转发渲染出错也碰不到管理端口不变量。目标可填域名（周期重解析、失败回退上次 IP）。
-> 转发端口走 forward hook，**不过**放行名单（标准转发语义）。
+> 转发端口走 forward hook，默认**不过**放行名单（标准转发语义），开启转发名单门后受名单约束（ADR 0008）。
 
 ## 开发
 
 ```sh
-cargo test                  # 102 项（agent + proto）：Noise 握手/配对 + 放行→撤销 + 端口转发增删改 + SSH 暴露切换 端到端（真 TCP+Noise）+ ruleset/nat 渲染 + 隧道密钥种子抽取 + sshd 认证态势解析/受管块插入·剥离
+cargo test                  # 115 项（agent + proto）：Noise 握手/配对 + 放行→撤销 + 端口转发增删改 + SSH 暴露 / 转发名单门切换 端到端（真 TCP+Noise）+ ruleset/nat 渲染 + 隧道密钥种子抽取 + sshd 认证态势解析/受管块插入·剥离
 cargo clippy --all-targets
 cargo run -- --config <cfg> print-ruleset   # 非 Linux 可跑（纯渲染）
 cargo run -- --config <cfg> pair            # 非 Linux 可跑（生成 Noise 密钥 + 配对码）

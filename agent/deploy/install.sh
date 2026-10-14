@@ -441,7 +441,17 @@ if [ -n "$admin_ips" ]; then
   done <<<"$admin_ips"
 fi
 warn "SSH 端口 $eff_ssh_port 已由 ruleset 无条件放行，default-drop 不会锁死 SSH。"
-warn "若本机对外提供 Web 等服务，务必把 80/443 写进 config.json 的 public_tcp！"
+
+# 全新安装默认开转发名单门（ADR 0008）：端口转发与 Docker 映射端口同样只放名单与公开端口。
+# 保留了既有配置的（升级）主机不动，免得突然掐断在用的转发；内核不支持则保持全开，不阻断安装。
+if [ "$config_fresh" = 1 ]; then
+  if gate_out="$("$PREFIX/ipgate-agent" --config "$CONF_DIR/config.json" forward-expose --allowlist 2>&1)"; then
+    log "已开启转发名单门：端口转发与 Docker 映射端口同样只放行名单内 IP 与公开端口。"
+  else
+    warn "转发名单门未开启，转发（含 Docker 映射）保持对全网开放：$gate_out"
+  fi
+fi
+warn "若本机对外提供 Web 等服务（含 Docker 映射端口），务必把 80/443 写进 config.json 的 public_tcp！"
 
 # --- 安装 systemd unit + 升级命令 ---
 install_unit

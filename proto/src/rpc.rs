@@ -82,6 +82,9 @@ pub enum RpcRequest {
     GetSettings,
     /// 切换 SSH 端口暴露：true=仅放行名单，false=对所有人开放。返回 [`AgentSettings`]。
     SetSshExposure { allowlist_only: bool },
+    /// 切换转发名单门（ADR 0008）：true=被 DNAT 进来的新建连接仅放行名单/公开端口，
+    /// false=转发对所有人开放。返回 [`AgentSettings`]；内核不支持时报 `NftFailure` 且不改设置。
+    SetForwardExposure { allowlist_only: bool },
     /// 开/关系统 sshd 的密码登录（写 sshd_config drop-in → 校验 → reload）。返回 [`AgentSettings`]。
     /// `enabled=false`（关闭）是加固方向；`enabled=true`（开启）会扩大爆破面，客户端须强确认。
     SetSshPasswordAuth { enabled: bool },
@@ -107,6 +110,12 @@ pub struct AgentSettings {
     /// `PermitRootLogin` 原值（展示用：yes / no / prohibit-password / forced-commands-only）。`None` 同上。
     #[serde(default)]
     pub ssh_permit_root_login: Option<String>,
+    /// 转发名单门开关（见 [`crate::RulesetConfig::forward_allowlist_only`]）。`None` = 旧版 agent 不支持。
+    #[serde(default)]
+    pub forward_allowlist_only: Option<bool>,
+    /// 门是否实际生效：开关开但内核/nft 不认门链表达式时为 false（已退回无门 ruleset）。`None` 同上。
+    #[serde(default)]
+    pub forward_gate_active: Option<bool>,
 }
 
 /// 隧道内的 RPC 响应。成功负载按对应 op 的类型编码（客户端据 op 反序列化）；

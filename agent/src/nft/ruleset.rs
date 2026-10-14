@@ -143,7 +143,35 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
     s.push_str(&format!("        ip saddr @{NFT_SET_ALLOW4} accept\n"));
     s.push_str(&format!("        ip6 saddr @{NFT_SET_ALLOW6} accept\n"));
     s.push_str("    }\n");
+    if cfg.forward_allowlist_only {
+        s.push_str(&render_forward_gate());
+    }
     s.push_str("}\n");
+    s
+}
+
+/// 转发名单门（ADR 0008）：被任何表 DNAT 过的新建连接（native 转发 / dnat 工具 / Docker `-p`）
+/// 只放名单源 IP 与公开端口（按 DNAT 前的原始目的端口），其余丢弃。
+///
+/// 无参静态模板，不含任何转发条目——渲染风险面与 input 链相同，不破两表隔离（ADR 0005）。
+/// policy accept：未被 DNAT 的转发（容器出网、VPN 路由）不受影响。drop 终局，故其它表
+/// （Docker、`ip ipgate_nat`、dnat_utils）forward 链里的 accept 救不回被门丢弃的包；
+/// priority -10 让门先于它们（filter 0）求值。
+fn render_forward_gate() -> String {
+    let dnat_new = "ct state new ct status dnat";
+    let mut s = String::from("    chain forward {\n");
+    s.push_str("        type filter hook forward priority -10; policy accept;\n");
+    s.push_str("        ct state established,related accept\n");
+    s.push_str(&format!("        {dnat_new} ip saddr @{NFT_SET_ALLOW4} accept\n"));
+    s.push_str(&format!("        {dnat_new} ip6 saddr @{NFT_SET_ALLOW6} accept\n"));
+    s.push_str(&format!(
+        "        {dnat_new} meta l4proto tcp ct original proto-dst @{NFT_SET_PUBLIC_TCP} accept\n"
+    ));
+    s.push_str(&format!(
+        "        {dnat_new} meta l4proto udp ct original proto-dst @{NFT_SET_PUBLIC_UDP} accept\n"
+    ));
+    s.push_str(&format!("        {dnat_new} counter drop\n"));
+    s.push_str("    }\n");
     s
 }
 
@@ -247,10 +275,8 @@ mod tests {
     #[test]
     fn public_ports_rendered_as_ranges() {
         let cfg = RulesetConfig {
-            ssh_port: 22,
-            ssh_allowlist_only: false,
             public_tcp: vec![PortRange::single(443), PortRange { start: 8000, end: 8010 }],
-            public_udp: vec![],
+            ..RulesetConfig::default()
         };
         let s = render_apply(&cfg, &[], Utc::now());
         assert!(s.contains("set public_tcp { type inet_service; flags interval; elements = { 443, 8000-8010 } }"));
@@ -274,5 +300,52 @@ mod tests {
         // 仍保持 default-drop 与 loopback 不变量。
         assert!(s.contains("policy drop;"));
         assert!(s.contains("iif lo accept"));
+    }
+
+    fn gated() -> RulesetConfig {
+        RulesetConfig {
+            forward_allowlist_only: true,
+            ..RulesetConfig::default()
+        }
+    }
+
+    #[test]
+    fn forward_gate_off_leaves_forward_hook_untouched() {
+        // 默认关：不接管 forward hook —— 升级后转发行为与旧版一致。
+        let s = render_apply(&RulesetConfig::default(), &[], Utc::now());
+        assert!(!s.contains("hook forward"));
+    }
+
+    #[test]
+    fn forward_gate_drops_dnat_new_conns_not_from_allowlist() {
+        let s = render_apply(&gated(), &[], Utc::now());
+        let gate = &s[s.find("    chain forward {").expect("应渲染 forward 链")..];
+        let lines: Vec<&str> = gate.lines().map(str::trim).collect();
+        assert_eq!(
+            lines[1..8],
+            [
+                "type filter hook forward priority -10; policy accept;",
+                "ct state established,related accept",
+                "ct state new ct status dnat ip saddr @allow4 accept",
+                "ct state new ct status dnat ip6 saddr @allow6 accept",
+                "ct state new ct status dnat meta l4proto tcp ct original proto-dst @public_tcp accept",
+                "ct state new ct status dnat meta l4proto udp ct original proto-dst @public_udp accept",
+                "ct state new ct status dnat counter drop",
+            ]
+        );
+    }
+
+    #[test]
+    fn forward_gate_keeps_input_chain_byte_identical() {
+        // 门只追加 forward 链：input 链（SSH 自锁不变量所在）逐字节不变，与 SSH 开关正交。
+        for ssh_allowlist_only in [false, true] {
+            let off = RulesetConfig { ssh_allowlist_only, ..RulesetConfig::default() };
+            let on = RulesetConfig { ssh_allowlist_only, ..gated() };
+            let a = render_apply(&off, &[], Utc::now());
+            let b = render_apply(&on, &[], Utc::now());
+            let input_end = a.rfind("    }\n").unwrap();
+            assert_eq!(a[..input_end], b[..input_end]);
+            assert!(b.ends_with("    }\n}\n"));
+        }
     }
 }
