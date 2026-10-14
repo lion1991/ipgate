@@ -51,6 +51,17 @@ pub struct State {
     /// 客户端可经 `SetSshExposure` 切换。运行期可调，故存这里而非静态 config.json。
     #[serde(default)]
     pub ssh_allowlist_only: bool,
+    /// 转发名单门开关（ADR 0008）。默认 false=转发对全网开放（升级零行为变化）；
+    /// 客户端可经 `SetForwardExposure` 切换。
+    #[serde(default)]
+    pub forward_allowlist_only: bool,
+}
+
+/// ruleset 的运行期开关（存 store），由 [`crate::config::AgentConfig::ruleset_with`] 注入渲染。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RulesetFlags {
+    pub ssh_allowlist_only: bool,
+    pub forward_allowlist_only: bool,
 }
 
 pub struct Store {
@@ -147,14 +158,26 @@ impl Store {
 
     // ---- SSH 端口暴露模式（ADR 0007）----
 
-    pub fn ssh_allowlist_only(&self) -> bool {
-        self.state.ssh_allowlist_only
-    }
-
     /// 设置 SSH 暴露模式；返回是否发生了变化（便于调用方决定是否需要重建 ruleset）。
     pub fn set_ssh_allowlist_only(&mut self, on: bool) -> bool {
         let changed = self.state.ssh_allowlist_only != on;
         self.state.ssh_allowlist_only = on;
+        changed
+    }
+
+    // ---- 转发名单门（ADR 0008）----
+
+    pub fn ruleset_flags(&self) -> RulesetFlags {
+        RulesetFlags {
+            ssh_allowlist_only: self.state.ssh_allowlist_only,
+            forward_allowlist_only: self.state.forward_allowlist_only,
+        }
+    }
+
+    /// 设置转发名单门；返回是否发生了变化。
+    pub fn set_forward_allowlist_only(&mut self, on: bool) -> bool {
+        let changed = self.state.forward_allowlist_only != on;
+        self.state.forward_allowlist_only = on;
         changed
     }
 
@@ -429,6 +452,35 @@ mod tests {
         let reloaded = Store::load(&p).unwrap();
         assert_eq!(reloaded.entries().len(), 1);
         assert_eq!(reloaded.revision(), 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn legacy_state_loads_with_forward_gate_off() {
+        // 升级前的 state.json 没有该字段：必须读成「门关」，否则升级会突然断掉在用的转发。
+        let p = std::env::temp_dir().join(format!("ipgate-test-{}.json", EntryId::new()));
+        std::fs::write(&p, r#"{"entries":[],"devices":[],"revision":0,"ssh_allowlist_only":true}"#)
+            .unwrap();
+        let s = Store::load(&p).unwrap();
+        assert_eq!(
+            s.ruleset_flags(),
+            RulesetFlags { ssh_allowlist_only: true, forward_allowlist_only: false }
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn forward_gate_flag_reports_change_and_persists() {
+        let p = std::env::temp_dir().join(format!("ipgate-test-{}.json", EntryId::new()));
+        {
+            let mut s = Store::load(&p).unwrap();
+            assert!(s.set_forward_allowlist_only(true));
+            assert!(!s.set_forward_allowlist_only(true));
+            s.save().unwrap();
+        }
+        let s = Store::load(&p).unwrap();
+        assert!(s.ruleset_flags().forward_allowlist_only);
+        assert!(!s.ruleset_flags().ssh_allowlist_only);
         let _ = std::fs::remove_file(&p);
     }
 }

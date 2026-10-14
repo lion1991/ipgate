@@ -33,6 +33,7 @@ use ipnet::IpNet;
 use nft::{NatBackend, NftBackend, NftCli};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use store::{LockExt, Store};
@@ -150,6 +151,18 @@ enum Cmd {
         #[arg(long)]
         allowlist: bool,
     },
+    /// 切换转发名单门（ADR 0008，控制台救援用）：写存储 + 立刻重建 ruleset。
+    ///
+    /// 开门后被 DNAT 进来的新建连接（native 转发 / dnat 工具 / Docker `-p`）仅放行名单内源 IP
+    /// 与公开端口。误拦了在用的转发时 `ipgate-agent forward-expose --open` 立即放开。
+    ForwardExpose {
+        /// 转发对所有人开放（关门）。
+        #[arg(long, conflicts_with = "allowlist")]
+        open: bool,
+        /// 转发仅放行名单内源 IP 与公开端口（开门）。
+        #[arg(long)]
+        allowlist: bool,
+    },
     /// 打印将要应用的 nftables ruleset（不改内核，便于审计）。
     PrintRuleset,
     /// 显示存储条目与内核 set 当前状态。
@@ -212,13 +225,14 @@ fn main() -> Result<()> {
             print!(
                 "{}",
                 nft::render_apply(
-                    &cfg.ruleset_with(store.ssh_allowlist_only()),
+                    &cfg.ruleset_with(store.ruleset_flags()),
                     store.entries(),
                     Utc::now()
                 )
             );
         }
         Cmd::SshExpose { open, allowlist } => ssh_expose_cli(&cfg, open, allowlist)?,
+        Cmd::ForwardExpose { open, allowlist } => forward_expose_cli(&cfg, open, allowlist)?,
         Cmd::Status => status(&cfg)?,
         Cmd::Uninstall => {
             NftCli::new().flush()?;
@@ -655,13 +669,14 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
     let store = Arc::new(Mutex::new(Store::load(&cfg.store_path())?));
 
     // 启动即清过期 + 全量原子重建（坐实 default-drop 与管理端口放行不变量）。
-    {
+    let forward_gate_active = {
         let mut s = store.lock_safe();
         if !s.prune_expired(Utc::now()).is_empty() {
             s.save()?;
         }
-        backend.apply(&cfg.ruleset_with(s.ssh_allowlist_only()), s.entries())?;
-    }
+        nft::apply_ruleset(&*backend, &cfg.ruleset_with(s.ruleset_flags()), s.entries())?.active()
+    };
+    let forward_gate_active = Arc::new(AtomicBool::new(forward_gate_active));
     info!("ruleset 已应用");
 
     // 端口转发：启动期解析 + 落地一次（独立 `ip ipgate_nat` 表，与上面互不相干）。
@@ -686,7 +701,8 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
     // 后台对账线程（阻塞式，独立于 async server）。
     {
         let (store, backend, cfg) = (store.clone(), backend.clone(), cfg.clone());
-        std::thread::spawn(move || reconcile_loop(cfg, store, backend, interval));
+        let gate = forward_gate_active.clone();
+        std::thread::spawn(move || reconcile_loop(cfg, store, backend, gate, interval));
     }
     // 端口转发周期重解析线程（域名 IP 漂移自愈，独立于对账）。
     {
@@ -707,6 +723,7 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
             cfg.rate_limit_per_min,
             Duration::from_secs(60),
         )),
+        forward_gate_active,
     };
     info!(%addr, "启动 Noise JSON-RPC 服务（仅 loopback；经 SSH 隧道访问）");
 
@@ -718,17 +735,18 @@ fn reconcile_loop(
     cfg: Arc<AgentConfig>,
     store: Arc<Mutex<Store>>,
     backend: Arc<dyn NftBackend + Send + Sync>,
+    forward_gate_active: Arc<AtomicBool>,
     interval: u64,
 ) {
     loop {
         std::thread::sleep(Duration::from_secs(interval));
         let now = Utc::now();
-        let (entries, ssh_allowlist_only) = {
+        let entries = {
             let mut s = store.lock_safe();
             if !s.prune_expired(now).is_empty() {
                 let _ = s.save();
             }
-            (s.entries().to_vec(), s.ssh_allowlist_only())
+            s.entries().to_vec()
         };
         match backend.list() {
             Ok(kernel) => {
@@ -751,7 +769,11 @@ fn reconcile_loop(
             }
             Err(e) => {
                 warn!(error = %e, "对账读取内核失败，全量重建");
-                let _ = backend.apply(&cfg.ruleset_with(ssh_allowlist_only), &entries);
+                // 持锁重建：开关取此刻最新值，并与 RPC 开关的「apply + 落盘」串行，不会用过期开关覆盖。
+                let s = store.lock_safe();
+                if let Ok(gate) = nft::apply_ruleset(&*backend, &cfg.ruleset_with(s.ruleset_flags()), s.entries()) {
+                    forward_gate_active.store(gate.active(), Ordering::SeqCst);
+                }
             }
         }
     }
@@ -768,16 +790,59 @@ fn ssh_expose_cli(cfg: &AgentConfig, open: bool, allowlist: bool) -> Result<()> 
     store.set_ssh_allowlist_only(on);
     store.save()?;
     // 直接落内核（救援场景：可能没有运行中的服务来对账）。
-    NftCli::new().apply(&cfg.ruleset_with(on), store.entries())?;
+    nft::apply_ruleset(&NftCli::new(), &cfg.ruleset_with(store.ruleset_flags()), store.entries())?;
     if on {
         println!("已设为：SSH 端口仅放行名单内源 IP 可连。");
     } else {
         println!("已设为：SSH 端口对所有人开放。");
     }
-    eprintln!(
-        "若 ipgate-agent 服务正在运行，请执行 `systemctl restart ipgate-agent` 同步其内存状态。"
-    );
+    restart_service_if_running();
     Ok(())
+}
+
+/// 控制台救援 / 装机：切换转发名单门，写存储并立刻重建 ruleset。
+fn forward_expose_cli(cfg: &AgentConfig, open: bool, allowlist: bool) -> Result<()> {
+    let on = match (open, allowlist) {
+        (true, false) => false,
+        (false, true) => true,
+        _ => anyhow::bail!("请二选一指定 --open（转发对所有人开放）或 --allowlist（仅放行名单）"),
+    };
+    let mut store = Store::load(&cfg.store_path())?;
+    store.set_forward_allowlist_only(on);
+    let gate =
+        nft::apply_ruleset(&NftCli::new(), &cfg.ruleset_with(store.ruleset_flags()), store.entries())?;
+    if let nft::Gate::Rejected(e) = gate {
+        // 内核已退回无门 ruleset：不落盘开关，免得存储与内核不一致。
+        anyhow::bail!(
+            "转发名单门加载失败，转发保持对全网开放（常见原因：内核/nft 不支持 ct status / ct original 匹配）：{e:#}"
+        );
+    }
+    store.save()?;
+    if on {
+        println!("已设为：转发（含 Docker 映射端口）仅放行名单内源 IP 与公开端口。");
+    } else {
+        println!("已设为：转发对所有人开放。");
+    }
+    restart_service_if_running();
+    Ok(())
+}
+
+/// 服务在跑时重启它：CLI 改的是磁盘上的 state.json，服务内存里仍是旧开关，
+/// 不重启的话它下一次落盘或整表重建就会把这次改动撤销（救援白做）。
+fn restart_service_if_running() {
+    let running = std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", "ipgate-agent"])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !running {
+        return;
+    }
+    match std::process::Command::new("systemctl").args(["restart", "ipgate-agent"]).status() {
+        Ok(s) if s.success() => eprintln!("已重启 ipgate-agent 服务以同步新设置。"),
+        _ => eprintln!(
+            "警告：重启 ipgate-agent 失败。请手动执行 `systemctl restart ipgate-agent`，否则服务会把这次改动撤销。"
+        ),
+    }
 }
 
 fn status(cfg: &AgentConfig) -> Result<()> {
@@ -787,6 +852,12 @@ fn status(cfg: &AgentConfig) -> Result<()> {
         store.entries().len(),
         store.revision(),
         store.devices().len()
+    );
+    let flags = store.ruleset_flags();
+    println!(
+        "SSH：{}；转发名单门：{}",
+        if flags.ssh_allowlist_only { "仅名单" } else { "对所有人开放" },
+        if flags.forward_allowlist_only { "开（转发仅名单/公开端口）" } else { "关（转发对所有人开放）" },
     );
     for e in store.entries() {
         let exp = e

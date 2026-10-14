@@ -24,6 +24,7 @@
 
 - **放行名单 (Allowlist)**：被允许访问的 IP / CIDR 集合，落地为 nftables 的一个 named set。
 - **条目 (Entry)**：名单中的一条，含 IP/CIDR、备注、过期时间（可选）。
+- **转发名单门**：可选开关。开启后，被 DNAT 进来的新建连接（端口转发、Docker 映射端口）也只放行名单内 IP 与公开端口（ADR 0008）。
 - **agent**：远程主机上的服务端进程，唯一有权改动 nftables 的组件。
 - **客户端 (Client)**：跨端 GUI，所有操作通过 agent 完成，自身不直接碰内核。
 

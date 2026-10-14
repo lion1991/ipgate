@@ -81,7 +81,7 @@ table inet ipgate {
 
 设计要点：
 - **`output` 不接管**（默认 accept）：保证主机能主动外联（agent 自身、系统更新等）。
-- **`forward` v1 不接管**：仅在路由/NAT 场景需要，留作后续配置项。
+- **`forward` 只挂可选的转发名单门**（ADR 0008）：开关打开时加一条 policy accept 的 forward 链，只拦「被 DNAT 且源不在名单/非公开端口」的新建连接；关闭时不渲染，forward hook 完全不接管。
 - **v4/v6 分两个 set**（`inet` family 下 set 类型不能混 v4/v6）。
 - **`flags interval`** 让 set 支持 CIDR/区间。
 - **放行名单语义**：名单源 IP 获得（除公开端口外其余端口的）访问；**每条目按端口细分**留作 v2。
@@ -141,7 +141,7 @@ table inet ipgate {
 ## 待定 / 推后
 
 - 每条目按端口细分放行（v2）。
-- `forward` 链 / NAT 场景。
+- ~~`forward` 链 / NAT 场景。~~ **已定（2026-10-14）**：NAT 落地见 ADR 0005；forward 名单门见 ADR 0008。
 - base chain 变更的定时自动回滚安全网（v1.1）。
 - ~~公开端口 ICMP echo 是否默认放行（隐蔽性 vs 可运维性）。~~ **已定（2026-06-24）：echo(ping) 默认不放，
   只放给名单源 IP**——隐蔽性优先,未放行 IP ping 不通;PMTUD 错误类仍放行以防黑洞。

@@ -1,5 +1,6 @@
 //! agent 配置。
 
+use crate::store::RulesetFlags;
 use anyhow::{bail, Context, Result};
 use ipgate_proto::{PortRange, RulesetConfig, DEFAULT_MGMT_PORT, DEFAULT_SSH_PORT};
 use serde::{Deserialize, Serialize};
@@ -80,11 +81,12 @@ impl AgentConfig {
         Ok(())
     }
 
-    /// 构造 ruleset 配置；`ssh_allowlist_only` 是运行期可调状态（存在 store），由调用方注入。
-    pub fn ruleset_with(&self, ssh_allowlist_only: bool) -> RulesetConfig {
+    /// 构造 ruleset 配置；`flags` 是运行期可调开关（存在 store），由调用方注入。
+    pub fn ruleset_with(&self, flags: RulesetFlags) -> RulesetConfig {
         RulesetConfig {
             ssh_port: self.ssh_port,
-            ssh_allowlist_only,
+            ssh_allowlist_only: flags.ssh_allowlist_only,
+            forward_allowlist_only: flags.forward_allowlist_only,
             public_tcp: self.public_tcp.clone(),
             public_udp: self.public_udp.clone(),
         }
@@ -104,7 +106,7 @@ mod tests {
         let c = AgentConfig::default();
         assert_eq!(c.mgmt_port, 19186);
         assert_eq!(c.ssh_port, 22);
-        assert_eq!(c.ruleset_with(false).ssh_port, 22);
+        assert_eq!(c.ruleset_with(RulesetFlags::default()).ssh_port, 22);
         c.validate().unwrap();
     }
 

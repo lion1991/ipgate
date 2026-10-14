@@ -35,6 +35,47 @@ pub trait NftBackend {
     fn flush(&self) -> anyhow::Result<()>;
 }
 
+/// 整表 apply 后转发名单门的实际状态（ADR 0008）。
+#[derive(Debug)]
+pub enum Gate {
+    /// 开关关闭，未渲染门链。
+    Off,
+    Active,
+    /// 门开但带门 ruleset 被拒，已退回无门；附 nft 原始错误（区分「不支持」与临时故障）。
+    Rejected(anyhow::Error),
+}
+
+impl Gate {
+    pub fn active(&self) -> bool {
+        matches!(self, Gate::Active)
+    }
+}
+
+/// 整表应用 ruleset，返回转发名单门的实际状态。
+///
+/// 门开但带门 ruleset 加载失败（如老内核/老 nft 不认 `ct status`/`ct original`）时，
+/// 告警并退回无门模板：事务原子，失败时内核仍是旧表，重试即回到已知良态——
+/// 门的问题绝不能连带 input 链（SSH 入口、放行名单）落地失败。
+pub fn apply_ruleset(
+    backend: &dyn NftBackend,
+    cfg: &RulesetConfig,
+    entries: &[Entry],
+) -> anyhow::Result<Gate> {
+    if !cfg.forward_allowlist_only {
+        backend.apply(cfg, entries)?;
+        return Ok(Gate::Off);
+    }
+    match backend.apply(cfg, entries) {
+        Ok(()) => Ok(Gate::Active),
+        Err(e) => {
+            tracing::warn!(error = %e, "转发名单门加载失败，退回无门 ruleset（转发对全网开放）");
+            let ungated = RulesetConfig { forward_allowlist_only: false, ..cfg.clone() };
+            backend.apply(&ungated, entries)?;
+            Ok(Gate::Rejected(e))
+        }
+    }
+}
+
 /// 端口转发落地后端（独立于 [`NftBackend`]，对应 `ip ipgate_nat` 表）。
 ///
 /// 与放行名单分两个 trait：转发是**整表全量重建**（规则少、且 DNS 重解析后需整体换），
@@ -44,4 +85,82 @@ pub trait NatBackend {
     fn apply_nat(&self, forwards: &[ResolvedForward]) -> anyhow::Result<()>;
     /// 清空：删除整张 `ip ipgate_nat` 表（无转发时）。
     fn flush_nat(&self) -> anyhow::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// 记录每次 apply 的配置；`gate_ok=false` 模拟内核/nft 不认门链表达式（老内核/老 nft）。
+    struct Recorder {
+        gate_ok: bool,
+        ungated_ok: bool,
+        applied: Mutex<Vec<RulesetConfig>>,
+    }
+
+    impl Recorder {
+        fn new(gate_ok: bool, ungated_ok: bool) -> Self {
+            Self { gate_ok, ungated_ok, applied: Mutex::new(Vec::new()) }
+        }
+    }
+
+    impl NftBackend for Recorder {
+        fn apply(&self, cfg: &RulesetConfig, _entries: &[Entry]) -> anyhow::Result<()> {
+            let ok = if cfg.forward_allowlist_only { self.gate_ok } else { self.ungated_ok };
+            if !ok {
+                anyhow::bail!("nft -f 失败");
+            }
+            self.applied.lock().unwrap().push(cfg.clone());
+            Ok(())
+        }
+        fn add(&self, _: &Entry) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn remove(&self, _: &IpNet) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list(&self) -> anyhow::Result<Vec<KernelElement>> {
+            Ok(Vec::new())
+        }
+        fn flush(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn cfg(ssh: bool, fwd: bool) -> RulesetConfig {
+        RulesetConfig { ssh_allowlist_only: ssh, forward_allowlist_only: fwd, ..RulesetConfig::default() }
+    }
+
+    #[test]
+    fn gate_reported_active_when_kernel_accepts_it() {
+        let b = Recorder::new(true, true);
+        assert!(matches!(apply_ruleset(&b, &cfg(false, true), &[]).unwrap(), Gate::Active));
+        assert_eq!(*b.applied.lock().unwrap(), vec![cfg(false, true)]);
+    }
+
+    #[test]
+    fn gate_rejected_falls_back_to_ungated_ruleset() {
+        // 门链加载失败不能连带 input 链（SSH 入口）一起失败：退回无门模板，其余开关原样保留。
+        let b = Recorder::new(false, true);
+        match apply_ruleset(&b, &cfg(true, true), &[]).unwrap() {
+            Gate::Rejected(e) => assert!(e.to_string().contains("nft -f 失败"), "须保留 nft 原始错误"),
+            g => panic!("期望 Rejected，得到 {g:?}"),
+        }
+        assert_eq!(*b.applied.lock().unwrap(), vec![cfg(true, false)]);
+    }
+
+    #[test]
+    fn gate_off_applies_once_and_reports_inactive() {
+        let b = Recorder::new(false, true);
+        assert!(matches!(apply_ruleset(&b, &cfg(false, false), &[]).unwrap(), Gate::Off));
+        assert_eq!(b.applied.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ungated_failure_still_surfaces_error() {
+        let b = Recorder::new(false, false);
+        assert!(apply_ruleset(&b, &cfg(false, true), &[]).is_err());
+        assert!(apply_ruleset(&b, &cfg(false, false), &[]).is_err());
+    }
 }
