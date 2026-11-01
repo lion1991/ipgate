@@ -144,7 +144,7 @@ pub(crate) async fn serve_on(
         let dc = dev_conns.clone();
         tokio::spawn(async move {
             let _permit = permit; // 持有至连接结束，drop 时自动归还名额。
-            if let Err(e) = handle_conn(stream, peer.ip(), st, id, psk, dc).await {
+            if let Err(e) = handle_conn(stream, peer, st, id, psk, dc).await {
                 tracing::debug!(error = %e, "Noise 连接结束");
             }
         });
@@ -153,12 +153,15 @@ pub(crate) async fn serve_on(
 
 async fn handle_conn(
     stream: tokio::net::TcpStream,
-    peer_ip: IpAddr,
+    peer: SocketAddr,
     st: AppState,
     identity: Arc<NoiseIdentity>,
     psk: [u8; 32],
     dev_conns: DeviceConns,
 ) -> Result<()> {
+    let local = stream.local_addr()?;
+    // whoami 用的客户端 IP：隧道下 peer 恒为 loopback，首次需要时经 /proc 反查 sshd 的真实对端（见 sshpeer）。
+    let mut client_ip: Option<IpAddr> = None;
     // 握手 + 鉴权（authorize 内部锁 store、消费配对码）。失败＝不发 msg2、静默关连接。
     // 整个握手套超时：慢/不发 msg1 的连接到点即弃，不会无限期占着名额与 fd（P1 修复）。
     let accept = noise::accept(stream, &identity, &psk, |peer, hello| authorize(&st, peer, hello));
@@ -207,13 +210,32 @@ async fn handle_conn(
             }
         };
         let resp = match serde_json::from_slice::<RpcRequest>(&raw) {
-            Ok(req) => dispatch(&st, device, peer_ip, req),
+            Ok(req) => {
+                if matches!(req, RpcRequest::Whoami) && client_ip.is_none() {
+                    client_ip = Some(resolve_client_ip(local, peer, st.cfg.ssh_port).await);
+                }
+                dispatch(&st, device, client_ip.unwrap_or(peer.ip()), req)
+            }
             Err(e) => {
                 RpcResponse::Err(ApiError::new(ErrorCode::BadRequest, format!("请求解析失败：{e}")))
             }
         };
         conn.send(&serde_json::to_vec(&resp)?).await?;
     }
+}
+
+async fn resolve_client_ip(local: SocketAddr, peer: SocketAddr, ssh_port: u16) -> IpAddr {
+    if !peer.ip().is_loopback() {
+        return peer.ip();
+    }
+    tokio::task::spawn_blocking(move || crate::sshpeer::resolve(local, peer, ssh_port))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            tracing::debug!("未能经 /proc 反查隧道的 SSH 对端，whoami 回退为 loopback");
+            peer.ip()
+        })
 }
 
 /// Noise 握手鉴权回调（同步）：已知设备直接放行；未知设备须带有效配对码。

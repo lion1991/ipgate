@@ -66,11 +66,8 @@ pub fn revoke(st: &AppState, req: RevokeRequest) -> ApiResult<()> {
     Ok(())
 }
 
-/// 回报 agent 在本连接上观测到的对端 IP。
-///
-/// TODO(ADR0007)：SSH 隧道模式下对端恒为 loopback——客户端真实外网 IP 需经 SSH 层
-/// 获取（如握手时由客户端经 exec 通道读 `$SSH_CONNECTION`，见 Phase 3）。直连模式下
-/// 此值即客户端外部 IP。
+/// 回报主机实际看到的客户端 IP：隧道下为 sshd 的对端（经 `sshpeer` 反查），
+/// 反查不到时为 loopback，客户端据此回退外部 echo。
 pub fn whoami(peer_ip: IpAddr) -> WhoamiResponse {
     WhoamiResponse { ip: peer_ip }
 }
