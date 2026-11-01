@@ -1,6 +1,6 @@
 # macOS 原生客户端（SwiftUI）实施方案
 
-状态：实施中（第 3 步完成）
+状态：实施中（第 4 步完成，待用户对比观感）
 日期：2026-11-01
 关联：ADR 0009（定案）、0007（传输）
 
@@ -26,7 +26,7 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
 1. **记录决策**：ADR 0009 + 本方案。✅
 2. **抽出 core**：✅ 搬移模块，`AppState` 改成不依赖 Tauri 的核心对象，Tauri 命令改为薄包装。Tauri 版行为不变；验证：core 单测 + Tauri 构建。
 3. **ffi + XCFramework**：✅ UniFFI 导出全部命令（`IpgateClient`）。给 Swift 用的 Record 在 ffi 里单独定义、由 proto/core 类型转换，**不给 proto 加 uniffi feature**——公开仓库零改动，类型也按 Swift 习惯设计（IP/CIDR/id 用字符串，时间用 `Date`）。`ffi/build-xcframework.sh` 产出 `ffi/out/IpgateFFI.xcframework` + `ipgate_ffi.swift`；`ffi/smoke/run.sh` 是 Swift 冒烟测试。
-4. **SwiftUI 样板**：主机侧栏 + 放行名单页（含放行当前 IP、撤销确认）。用户和 Tauri 版对比观感，确认后继续。
+4. **SwiftUI 样板**：✅ `client/mac/`（xcodegen 生成工程，`project.yml` 为准；预构建脚本自动跑 `ffi/build-xcframework.sh`）。主机侧栏（搜索）+ 放行名单页（Table、添加、放行本机、撤销确认、右键菜单、Delete 键）+ 右侧「访问与安全」inspector（本机出口 IP 是否已放行）+ 粘贴文本导入身份。文案沿用 Tauri 版。用户先在 Tauri 版导出身份、在原生版导入，对比观感后再做第 5 步。
 5. **补齐其余页面**：端口转发、安全设置、设备、配对、同步、身份导入导出，原生菜单栏与快捷键。
 
 ## SDK 27 用得上的 API
@@ -49,3 +49,5 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
 - **构建 ffi 时不要设 `MACOSX_DEPLOYMENT_TARGET`**：它也作用于宿主机的过程宏，rustc 1.92 按 27.0 链出的 dylib dyld 加载不了（`mis-aligned LINKEDIT string pool`），表现为 `can't find crate for serde_derive` 一类错误。已经生成的坏产物要 `cargo clean --release -p <宏 crate>` 清掉。
 - **Swift Record 不要叫 `Host`**：和 Foundation 的 `Host` 类重名，主机记录叫 `HostInfo`。
 - **modulemap 不用 `--xcframework`**：那会生成 `framework module`，而我们打的是静态库 XCFramework；模块名须为 `ipgate_ffiFFI`（生成的 Swift 源码按这个名字 import）。
+- **Swift 6.4 编译器在带标签元组的 `compactMap` 推断上会崩**（`failed to produce diagnostic for expression`）：改用小 struct。
+- **视图 body 里会写入的缓存（如每主机页面模型字典）标 `@ObservationIgnored`**：否则在视图更新中改了被观察状态。
