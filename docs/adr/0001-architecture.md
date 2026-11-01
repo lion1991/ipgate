@@ -22,6 +22,8 @@
 
 一套 Rust + WebView 代码产出 iOS / Android / Windows / macOS / Linux。与本仓库既有 `nexshell`（Rust/Tauri）一致，复用经验。
 
+> macOS 端已改用 SwiftUI 原生，Rust 核心共用，见 [ADR 0009](0009-macos-native-client.md)。
+
 ### 落地层：nftables named set
 
 放行名单落地为一个 named set（默认 `ipgate_allow`），规则只写一条 `ip saddr @ipgate_allow accept`，增删条目即增删 set 成员 —— O(1) 维护，避免逐条 rule 重排。
