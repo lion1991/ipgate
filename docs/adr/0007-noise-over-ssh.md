@@ -141,5 +141,5 @@ Noise 层夹在 TCP 与应用之间，使 reqwest/axum「跑在流上」很别�
 
 - 问题：部分网络（运营商 NAT 按目的地分配出口、代理分流、v4/v6 不一致）下，客户端经外部 echo 探到的 IP 与主机实际看到的不同，放行后仍连不上。
 - 做法：agent 收到隧道连接（对端恒为 loopback）的 `whoami` 时，经 `/proc/net/tcp{,6}` + `/proc/*/fd` 找到持有该 loopback socket 的 sshd 会话进程，取其 SSH 连接的对端地址返回（`agent/src/sshpeer.rs`）。依赖 agent 以 root 且不受 CAP_SYS_PTRACE 限制运行；反查失败回退 loopback。
-- 用户定案：客户端以主机实测 IP 为首要、最可信来源，「放行本机」默认用它；外部 echo 保留作对照，不一致时提示。agent 返回 loopback（旧版 / 反查失败）时回退外部 echo。
+- 用户定案：客户端以主机实测 IP 为首要、最可信来源，「放行本机」默认用它；外部 echo 保留作对照，不一致时提示。agent 返回 loopback（旧版 / 反查失败）时回退外部 echo。有实测时「已放行」只看实测 IP（外部 IP 放行了不算），「放行到全部主机」按各主机各自的实测分别放行。
 - 局限：反映的是本设备 SSH 连接的出口；本机其他应用若走不同分流路径仍可能不同。经跳板机时得到跳板 IP。
