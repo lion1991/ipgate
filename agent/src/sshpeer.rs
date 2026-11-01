@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const TCP_ESTABLISHED: u8 = 0x01;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 struct TcpRow {
     local: SocketAddr,
     remote: SocketAddr,
@@ -21,9 +21,9 @@ struct TcpRow {
 /// `local`/`peer` 是 agent 侧 accept 到的隧道连接两端。
 pub fn resolve(local: SocketAddr, peer: SocketAddr, ssh_port: u16) -> Option<IpAddr> {
     let mut rows = Vec::new();
-    for (path, v6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
         if let Ok(text) = std::fs::read_to_string(path) {
-            rows.extend(parse_proc_net_tcp(&text, v6));
+            rows.extend(parse_proc_net_tcp(&text));
         }
     }
     // sshd 侧的那一端：本地 = 我们看到的 peer，对端 = 我们的 local。
@@ -43,14 +43,14 @@ fn pick_client(rows: &[TcpRow], owned: &HashSet<u64>, ssh_port: u16) -> Option<I
         .filter(|r| {
             owned.contains(&r.inode)
                 && r.state == TCP_ESTABLISHED
-                && !canonical(r.remote.ip()).is_loopback()
+                && !r.remote.ip().to_canonical().is_loopback()
         })
         .collect();
     let hit = cands.iter().find(|r| r.local.port() == ssh_port).or(match cands.as_slice() {
         [only] => Some(only),
         _ => None,
     })?;
-    Some(canonical(hit.remote.ip()))
+    Some(hit.remote.ip().to_canonical())
 }
 
 /// 扫 `/proc/*/fd` 找持有 `inode` 的进程，返回该进程全部 socket inode。
@@ -78,23 +78,19 @@ fn parse_socket_link(l: &str) -> Option<u64> {
     l.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok()
 }
 
+/// 双栈 sshd 的 v4 连接在 tcp6 里是 `::ffff:a.b.c.d`，比较与输出前都还原为 v4。
 fn same(a: SocketAddr, b: SocketAddr) -> bool {
-    a.port() == b.port() && canonical(a.ip()) == canonical(b.ip())
+    a.port() == b.port() && a.ip().to_canonical() == b.ip().to_canonical()
 }
 
-/// `::ffff:a.b.c.d`（双栈 sshd 收的 v4 客户端）还原为 v4。
-fn canonical(ip: IpAddr) -> IpAddr {
-    ip.to_canonical()
-}
-
-fn parse_proc_net_tcp(text: &str, v6: bool) -> Vec<TcpRow> {
+fn parse_proc_net_tcp(text: &str) -> Vec<TcpRow> {
     text.lines()
         .skip(1)
         .filter_map(|line| {
             let f: Vec<&str> = line.split_whitespace().collect();
             Some(TcpRow {
-                local: parse_addr(f.get(1)?, v6)?,
-                remote: parse_addr(f.get(2)?, v6)?,
+                local: parse_addr(f.get(1)?)?,
+                remote: parse_addr(f.get(2)?)?,
                 state: u8::from_str_radix(f.get(3)?, 16).ok()?,
                 inode: f.get(9)?.parse().ok()?,
             })
@@ -103,24 +99,20 @@ fn parse_proc_net_tcp(text: &str, v6: bool) -> Vec<TcpRow> {
 }
 
 /// 内核按「内存字节当本机序 u32」以 `%08X` 打印地址，故按 u32 解析后取 `to_ne_bytes` 即还原网络序字节。
-fn parse_addr(s: &str, v6: bool) -> Option<SocketAddr> {
+fn parse_addr(s: &str) -> Option<SocketAddr> {
     let (ip, port) = s.split_once(':')?;
     let port = u16::from_str_radix(port, 16).ok()?;
     let word = |i: usize| u32::from_str_radix(ip.get(i * 8..i * 8 + 8)?, 16).ok().map(u32::to_ne_bytes);
-    let ip = if v6 {
-        if ip.len() != 32 {
-            return None;
+    let ip = match ip.len() {
+        8 => IpAddr::V4(Ipv4Addr::from(word(0)?)),
+        32 => {
+            let mut b = [0u8; 16];
+            for i in 0..4 {
+                b[i * 4..i * 4 + 4].copy_from_slice(&word(i)?);
+            }
+            IpAddr::V6(Ipv6Addr::from(b))
         }
-        let mut b = [0u8; 16];
-        for i in 0..4 {
-            b[i * 4..i * 4 + 4].copy_from_slice(&word(i)?);
-        }
-        IpAddr::V6(Ipv6Addr::from(b))
-    } else {
-        if ip.len() != 8 {
-            return None;
-        }
-        IpAddr::V4(Ipv4Addr::from(word(0)?))
+        _ => return None,
     };
     Some(SocketAddr::new(ip, port))
 }
@@ -129,7 +121,7 @@ fn parse_addr(s: &str, v6: bool) -> Option<SocketAddr> {
 mod tests {
     use super::*;
 
-    // 真实 /proc/net/tcp{,6} 片段（x86_64）：sshd 会话进程持有
+    // 按 /proc/net/tcp{,6} 格式构造（小端机）：sshd 会话进程持有
     //   inode 1001：203.0.113.7:51234 → 本机 :2222（客户端 SSH 连接）
     //   inode 1002：127.0.0.1:40000 → 127.0.0.1:19187（转发进 agent 的隧道）
     const TCP: &str = "\
@@ -152,7 +144,7 @@ mod tests {
 
     #[test]
     fn parses_v4_rows() {
-        let rows = parse_proc_net_tcp(TCP, false);
+        let rows = parse_proc_net_tcp(TCP);
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[1].local, sa("10.0.0.10:2222"));
         assert_eq!(rows[1].remote, sa("203.0.113.7:51234"));
@@ -162,7 +154,7 @@ mod tests {
 
     #[test]
     fn picks_ssh_client_of_tunnel_owner() {
-        let rows = parse_proc_net_tcp(TCP, false);
+        let rows = parse_proc_net_tcp(TCP);
         // agent 侧 accept 到 local=127.0.0.1:19187, peer=127.0.0.1:40000 → sshd 侧 inode 1002。
         let tunnel = rows
             .iter()
@@ -179,7 +171,7 @@ mod tests {
 
     #[test]
     fn v4_mapped_v6_client_is_canonicalized() {
-        let rows = parse_proc_net_tcp(TCP6, true);
+        let rows = parse_proc_net_tcp(TCP6);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].local, sa("[::1]:22"));
         assert_eq!(pick_client(&rows, &[2001, 2002].into(), 22), Some(sa("198.51.100.9:0").ip()));
