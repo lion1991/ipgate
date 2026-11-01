@@ -1,6 +1,6 @@
 # macOS 原生客户端（SwiftUI）实施方案
 
-状态：实施中（4b 完成，下一步 4c）
+状态：实施中（4c 完成，下一步第 5 步）
 日期：2026-11-01
 关联：ADR 0009（定案）、0007（传输）
 
@@ -31,7 +31,7 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
 4. **SwiftUI 样板**：✅ `client/mac/`（xcodegen 生成工程，`project.yml` 为准；预构建脚本自动跑 `ffi/build-xcframework.sh`）。主机侧栏（搜索）+ 放行名单页（Table、添加、放行本机、撤销确认、右键菜单、Delete 键）+ 右侧「访问与安全」inspector（本机出口 IP 是否已放行）+ 粘贴文本导入身份。文案沿用 Tauri 版。用户先在 Tauri 版导出身份、在原生版导入，对比观感后再做第 5 步。
    - **4a 访问状态**：✅ 启动时并发刷新全部主机；侧栏状态图标 + 摘要；名单页「本机未放行」横幅；inspector 加 SSH 状态；「放行本机到全部主机」。
    - **4b 名单表格**：✅ 覆盖当前出口的条目标「当前」、列排序（默认保持 agent 顺序）、「添加时间」列（悬停看添加者）、多选批量撤销（一次确认）、「+」改为锚定弹出框。
-   - **4c 菜单栏图标 + 出口 IP 变化通知**。
+   - **4c 菜单栏图标 + 出口 IP 变化通知**：✅ 菜单栏窗口式面板（各主机状态、刷新、面板内两步确认的「放行本机到全部主机」、点主机打开主窗口）；主窗口改为单个 `Window`，关窗后留在菜单栏。网络切换（路径签名变化且可用）或唤醒后防抖 3 秒：core `reset_connections` 丢弃旧连接 → 强制重探全部主机 → 出口变了且有主机未放行才发通知（首次需要时申请权限，点通知打开主窗口）。
 5. **补齐其余页面**：端口转发、安全设置、设备、配对、同步、身份导出/二维码；工具栏分段控件切换分区，同步、导出放「⋯」菜单。
 
 ## 界面设计决策
@@ -69,4 +69,6 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
 - **Swift Record 不要叫 `Host`**：和 Foundation 的 `Host` 类重名，主机记录叫 `HostInfo`。
 - **modulemap 不用 `--xcframework`**：那会生成 `framework module`，而我们打的是静态库 XCFramework；模块名须为 `ipgate_ffiFFI`（生成的 Swift 源码按这个名字 import）。
 - **Swift 6.4 编译器在带标签元组的 `compactMap` 推断上会崩**（`failed to produce diagnostic for expression`）：改用小 struct。
+- **Rust 构建放在聚合 target `RustCore`，不要放 app 的 preBuildScript**：Xcode 在 app target 的脚本阶段之前就把 XCFramework 头文件拷进构建目录，ffi 一改，第一次构建会用旧头文件报找不到符号。
+- **网络切换后先 `reset_connections` 再重探**：旧连接可能要等 30 秒 RPC 超时才发现断了；没断的话主机实测到的仍是旧出口。
 - **视图 body 里会写入的缓存（如每主机页面模型字典）标 `@ObservationIgnored`**：否则在视图更新中改了被观察状态。
