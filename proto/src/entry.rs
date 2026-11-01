@@ -57,8 +57,8 @@ pub struct Allowlist {
 
 /// `GET /v1/whoami` 响应：agent 实际观测到的客户端来源 IP。
 ///
-/// 这就是 nftables 将要匹配的源地址（客户端经 NAT/出口后的外部 IP），
-/// 比客户端自测公网 IP 更可信——直接取自本条 TLS 连接的对端地址。
+/// 这就是 nftables 将要匹配的源地址（客户端经 NAT/出口后的外部 IP），比客户端自测公网 IP
+/// 更可信——取自承载本连接的 SSH 会话的对端地址。旧版 agent 或反查失败时为 loopback。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WhoamiResponse {
     pub ip: std::net::IpAddr,

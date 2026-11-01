@@ -14,6 +14,7 @@ mod noise;
 mod reconcile;
 mod resolve;
 mod sshd;
+mod sshpeer;
 mod store;
 mod util;
 
