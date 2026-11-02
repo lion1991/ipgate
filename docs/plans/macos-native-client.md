@@ -1,6 +1,6 @@
 # macOS 原生客户端（SwiftUI）实施方案
 
-状态：第 1–5 步完成，功能与 Tauri 桌面版对齐；第 6 步（主窗口外壳改 AppKit）实施中
+状态：第 1–6 步完成，功能与 Tauri 桌面版对齐，主窗口外壳已改 AppKit，待用户日常试用
 日期：2026-11-01
 关联：ADR 0009（定案）、0010（外壳改 AppKit）、0007（传输）
 
@@ -38,7 +38,7 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
    - **5c 设备 + 主机管理**：✅ 「设备」分区（进分区重拉；本机标签、在线状态、吊销，吊销本机强警告）；侧栏右键与「主机」菜单共用主机管理：重命名、设置访问密钥、更新 Noise 公钥（可粘配对链接，先实握手校验）、对账（只读表单）、移除主机。
    - **5d 配对新主机**：✅ 侧栏「+」、文件菜单「添加主机…」⌘N、无主机时的空状态都能进；粘贴配对链接后同一表单内展开主机信息、显示名、本设备名，配对成功选中新主机并探测。
    - **5e 身份导出 / 二维码**：✅ 文件菜单「导出设备身份…」（无主机时不可用）；口令输两次，生成后显示白底黑码的多帧轮播二维码（0.9 秒一帧，与 Tauri 版同节奏）和文本备份，「拷贝备份」在底栏。macOS 只出码不扫码，扫码导入在手机端。
-6. **主窗口外壳改 AppKit**（ADR 0010）：`NavigationSplitView` + `.inspector` 换成 `NSSplitViewController`（左栏 / 内容 / 右栏）+ `NSToolbar`（按栏分段）；各栏内容仍是现有 SwiftUI 视图。原因：SwiftUI 驱动的右栏展开卡顿，左栏开着时还会把左栏推出窗口。先用验证工程实测开合流畅、不推栏，外观对齐后再迁移。
+6. **主窗口外壳改 AppKit**（ADR 0010）：✅ `NavigationSplitView` + `.inspector` 换成 `NSSplitViewController`（左栏 / 内容 / 右栏）+ `NSToolbar`（按栏分段）；各栏内容仍是现有 SwiftUI 视图。原因：SwiftUI 驱动的右栏展开卡顿，左栏开着时还会把左栏推出窗口。先用验证工程实测开合流畅、不推栏，外观对齐后再迁移。外壳在 `mac/ipgate/MainWindow.swift`：工具栏按钮统一在这里构建，状态用 `withObservationTracking` 从模型同步，页面里不再写 `.toolbar`；「放行」弹出框是锚在工具栏按钮上的 `NSPopover`；侧栏搜索是原生 `NSSearchField`。
 
 ## 界面设计决策
 
@@ -60,7 +60,7 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
 
 - 标准控件自动适配液态玻璃、系统玻璃透明度滑块、非活动窗口样式。
 - `alert` / `confirmationDialog` 的 `item:` 重载：撤销放行、删除转发、忘记主机的确认框。
-- 工具栏 `visibilityPriority(_:)`：窄窗口时主操作留在栏上；`ForEach` 可直接放进 `toolbar`。
+- 工具栏 `visibilityPriority`（AppKit `NSToolbarItem`）：窄窗口时主操作留在栏上。
 - `@State` 宏：`@Observable` 视图模型只初始化一次。
 
 写 SDK 27 新 API 前先读 Xcode 自带的 Apple 参考：
@@ -80,6 +80,8 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
 - **Rust 构建放在聚合 target `RustCore`，不要放 app 的 preBuildScript**：Xcode 在 app target 的脚本阶段之前就把 XCFramework 头文件拷进构建目录，ffi 一改，第一次构建会用旧头文件报找不到符号。
 - **网络切换后先 `reset_connections` 再重探**：旧连接可能要等 30 秒 RPC 超时才发现断了；没断的话主机实测到的仍是旧出口。
 - **视图 body 里会写入的缓存（如每主机页面模型字典）标 `@ObservationIgnored`**：否则在视图更新中改了被观察状态。
-- **工具栏分段控件要标 `visibilityPriority(.high)`，窗口最小宽 860**：否则窗口一窄，分区切换整个被挤进「»」溢出菜单；「放行本机」文字按钮让位（名单上方横幅里也有）。
+- **工具栏分段控件要 `visibilityPriority = .high` + `controlRepresentation = .expanded`，并设为 `centeredItemIdentifiers`，窗口最小宽 860**：否则窗口一窄，分区切换会被折成下拉或挤进「»」；不固定居中的话右侧按钮随分区增减，它会左右挪。「放行本机」优先级 `.low` 先让位（名单上方横幅里也有）。
+- **自定义 view 的工具栏项也要给 item 设 target / action**：收进溢出菜单时菜单项用的是 item 自己的，只设在按钮上会点不动。
+- **`NSSearchField` 点 × 清空、按 Esc 不发 `controlTextDidChange`**：要同时接 target / action，否则过滤停在旧关键字。
 - **整页加载用 `LoadingView`（0.3 秒后才显示转圈）**：数据通常百毫秒内回来，直接出 `ProgressView` 会一闪而过。
 - **SwiftUI 的 `NavigationSplitView` + `.inspector` 开合会卡、会推栏，改不掉**：左栏开着展开右栏，中间栏动画期间不缩，整体被推出窗口左侧、结束再弹回；最小工程也复现。拆分工具栏项、改最小宽度、加宽窗口、把 `.inspector` 挪到外层都治不了，最后换成 AppKit 外壳（ADR 0010）。排查时注意：给侧栏挂 `onGeometryChange` 会让问题消失，验证要用不改布局的手段（系统日志 + 用户实测）；菜单里的「显示检查器」不走动画，不能拿来测。
