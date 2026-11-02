@@ -8,7 +8,7 @@
 
 | 目录 | 角色 | 技术栈 | 说明 |
 |------|------|--------|------|
-| [`client/`](client/) | 客户端 | Tauri 2 + Rust + WebView | 一套代码出 iOS / Android / Windows / macOS / Linux 包。GUI 管理界面。 |
+| [`client/`](client/) | 客户端 | Tauri 2 + Rust + WebView | 一套代码出 iOS / Android / Windows / Linux 包，macOS 用 SwiftUI 原生版。GUI 管理界面。 |
 | [`agent/`](agent/) | 服务端 | Rust 守护进程 | 跑在远程 Linux 主机上，落地 nftables 规则，对客户端暴露 API。 |
 | [`proto/`](proto/) | 协议 | Rust crate（serde） | 客户端与 agent 共享的请求/响应类型，单一可信源。 |
 
