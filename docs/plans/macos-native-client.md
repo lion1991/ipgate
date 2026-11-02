@@ -79,3 +79,5 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
 - **Rust 构建放在聚合 target `RustCore`，不要放 app 的 preBuildScript**：Xcode 在 app target 的脚本阶段之前就把 XCFramework 头文件拷进构建目录，ffi 一改，第一次构建会用旧头文件报找不到符号。
 - **网络切换后先 `reset_connections` 再重探**：旧连接可能要等 30 秒 RPC 超时才发现断了；没断的话主机实测到的仍是旧出口。
 - **视图 body 里会写入的缓存（如每主机页面模型字典）标 `@ObservationIgnored`**：否则在视图更新中改了被观察状态。
+- **工具栏分段控件要标 `visibilityPriority(.high)`，窗口最小宽 860**：否则窗口一窄，分区切换整个被挤进「»」溢出菜单；「放行本机」文字按钮让位（名单上方横幅里也有）。
+- **整页加载用 `LoadingView`（0.3 秒后才显示转圈）**：数据通常百毫秒内回来，直接出 `ProgressView` 会一闪而过。
