@@ -29,5 +29,5 @@ Tauri 版在 macOS 上是 WKWebView + 自绘 CSS。窗口用的是 Overlay 标�
 ## 影响
 
 - 每个新功能在 macOS 上要写两遍 UI（SwiftUI + Tauri Web）；Rust 核心只写一遍。
-- Tauri 版的 macOS 构建暂时保留，原生版功能补齐后再决定是否停发（待用户决定）。
+- Tauri 版的 macOS 包停发（用户拍板，2026-11-01）：`client/scripts/build.sh` 不再打 dmg，macOS 只用原生版。Tauri 工程本身保留，其余平台还要用。
 - 客户端私有仓库（`client/`，不进本公开仓库）新增 `core/`、`ffi/`、`mac/` 三个目录，各自是独立 Cargo workspace / Xcode 工程，不并入根 workspace。
