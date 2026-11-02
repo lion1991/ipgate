@@ -81,3 +81,4 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
 - **视图 body 里会写入的缓存（如每主机页面模型字典）标 `@ObservationIgnored`**：否则在视图更新中改了被观察状态。
 - **工具栏分段控件要标 `visibilityPriority(.high)`，窗口最小宽 860**：否则窗口一窄，分区切换整个被挤进「»」溢出菜单；「放行本机」文字按钮让位（名单上方横幅里也有）。
 - **整页加载用 `LoadingView`（0.3 秒后才显示转圈）**：数据通常百毫秒内回来，直接出 `ProgressView` 会一闪而过。
+- **inspector 开关单独成 `ToolbarItem` 并标 `visibilityPriority(.high)`**：和刷新放同一个 `ToolbarItemGroup` 时，窗口约 1100 宽以下展开 inspector，动画期间主内容宽度不收缩，整个布局被推出窗口左侧、结束再弹回（工具栏跟着跳）。改窗口/详情栏最小宽度都治不了。验证别靠肉眼看录屏：临时给侧栏挂 `onGeometryChange` 打印 `frame(in: .global).minX`，用工具栏 AX 直查（`button of toolbar 1 whose description is …`）取坐标点击，多个宽度批量跑，minX < 0 即复现；菜单里的「显示检查器」不走动画，不能拿来测。
