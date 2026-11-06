@@ -6,7 +6,7 @@
 
 use super::error::{internal, ApiResult};
 use super::AppState;
-use crate::nft::Gate;
+use crate::nft::{Applied, Gate};
 use crate::reconcile;
 use crate::store::{LockExt, RulesetFlags};
 use chrono::Utc;
@@ -96,7 +96,9 @@ fn build_settings(st: &AppState) -> AgentSettings {
         ssh_kbd_interactive_auth: auth.kbd_interactive,
         ssh_permit_root_login: auth.permit_root,
         forward_allowlist_only: Some(flags.forward_allowlist_only),
-        forward_gate_active: Some(st.forward_gate_active.load(Ordering::SeqCst)),
+        forward_gate_active: Some(st.live.gate.load(Ordering::SeqCst)),
+        ssh_knock_port: st.cfg.ssh_knock.as_ref().map(|k| k.port),
+        ssh_knock_active: Some(st.live.knock.load(Ordering::SeqCst)),
     }
 }
 
@@ -104,15 +106,15 @@ pub fn get_settings(st: &AppState) -> AgentSettings {
     build_settings(st)
 }
 
-/// 按给定开关整表重建 ruleset，并回写门的实际生效态。
+/// 按给定开关整表重建 ruleset，并回写转发门 / 敲门的实际生效态。
 ///
 /// 调用方须持 store 锁直到开关落盘：整表重建因此与对账兜底重建、另一开关串行，
 /// 不会有人拿过期的开关把刚落地的 ruleset 覆盖掉。
-fn reapply_ruleset(st: &AppState, flags: RulesetFlags, entries: &[Entry]) -> ApiResult<Gate> {
-    let gate = crate::nft::apply_ruleset(&*st.backend, &st.cfg.ruleset_with(flags), entries)
+fn reapply_ruleset(st: &AppState, flags: RulesetFlags, entries: &[Entry]) -> ApiResult<Applied> {
+    let applied = crate::nft::apply_ruleset(&*st.backend, &st.cfg.ruleset_with(flags), entries)
         .map_err(|e| ApiError::new(ErrorCode::NftFailure, e.to_string()))?;
-    st.forward_gate_active.store(gate.active(), Ordering::SeqCst);
-    Ok(gate)
+    st.live.record(&applied);
+    Ok(applied)
 }
 
 /// 切换 SSH 端口暴露模式并整表重建 ruleset。
@@ -150,7 +152,15 @@ pub fn set_ssh_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<AgentS
                 ));
             }
         }
-        reapply_ruleset(st, flags, store.entries())?;
+        let applied = reapply_ruleset(st, flags, store.entries())?;
+        if let Gate::Rejected(e) = applied.knock {
+            // 没有敲门的「仅名单」会把不在名单里的设备（常换网络的手机）挡在外：恢复原 ruleset，不改设置。
+            reapply_ruleset(st, store.ruleset_flags(), store.entries())?;
+            return Err(ApiError::new(
+                ErrorCode::NftFailure,
+                format!("SSH 敲门规则加载失败，SSH 保持原状（常见原因：内核/nft 不支持 @th 载荷匹配或动态 set）：{e}"),
+            ));
+        }
         store.set_ssh_allowlist_only(allowlist_only);
         store.save().map_err(internal)?;
     }
@@ -245,7 +255,7 @@ pub fn set_forward_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<Ag
     {
         let mut store = st.store.lock_safe();
         let flags = RulesetFlags { forward_allowlist_only: allowlist_only, ..store.ruleset_flags() };
-        if let Gate::Rejected(e) = reapply_ruleset(st, flags, store.entries())? {
+        if let Gate::Rejected(e) = reapply_ruleset(st, flags, store.entries())?.gate {
             return Err(ApiError::new(
                 ErrorCode::NftFailure,
                 format!(

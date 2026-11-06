@@ -13,11 +13,14 @@ pub struct RulesetConfig {
     /// SSH 端口是否仅对放行名单开放（默认 false = 对所有人开放）。
     ///
     /// false：字面 `tcp dport <ssh_port> accept`，全世界可连（自锁不变量，最稳）。
-    /// true：去掉该无条件放行，SSH 仅经 `ip saddr @allow accept` 命中——即只有名单内
-    /// 源 IP 能连。**有自锁风险**：当前外网 IP 不在名单时会把自己（含管理隧道）挡在外，
-    /// 只能从 VPS 控制台用 `ipgate-agent ssh-expose --open` 恢复。开启前务必先放行自己。
+    /// true：去掉该无条件放行，SSH 只放名单内源 IP 与刚敲过门的源 IP（[`Self::ssh_knock`]，
+    /// ADR 0012）。敲门也不通时只能从 VPS 控制台用 `ipgate-agent ssh-expose --open` 恢复。
     #[serde(default)]
     pub ssh_allowlist_only: bool,
+    /// SSH 敲门参数（由 access key 派生，ADR 0012）。仅在 `ssh_allowlist_only` 时渲染；
+    /// `None` = 不渲染敲门规则（内核不支持时的降级）。含口令，不序列化。
+    #[serde(skip)]
+    pub ssh_knock: Option<SshKnock>,
     /// 转发名单门（ADR 0008）：被 DNAT 进来的新建连接（native 转发 / dnat 工具 / Docker `-p`）
     /// 是否也仅放行名单内源 IP 与公开端口。默认 false = 不接管 forward hook，转发对全网开放。
     #[serde(default)]
@@ -35,12 +38,41 @@ impl Default for RulesetConfig {
         Self {
             ssh_port: crate::DEFAULT_SSH_PORT,
             ssh_allowlist_only: false,
+            ssh_knock: None,
             forward_allowlist_only: false,
             public_tcp: Vec::new(),
             public_udp: Vec::new(),
         }
     }
 }
+
+impl RulesetConfig {
+    /// 是否渲染敲门规则：「仅名单」开着且有敲门参数。
+    pub fn knock(&self) -> Option<&SshKnock> {
+        self.ssh_knock.as_ref().filter(|_| self.ssh_allowlist_only)
+    }
+}
+
+/// SSH 敲门参数（ADR 0012）：发往 UDP `port`、载荷前 16 字节等于 `token` 的包让源 IP 获准连 SSH
+/// [`KNOCK_TTL_SECS`] 秒。agent 与客户端各自从 access key 派生（proto 不引密码学库）。
+#[derive(Clone, PartialEq, Eq)]
+pub struct SshKnock {
+    pub port: u16,
+    pub token: [u8; 16],
+}
+
+impl core::fmt::Debug for SshKnock {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SshKnock").field("port", &self.port).finish_non_exhaustive()
+    }
+}
+
+/// 敲门后源 IP 获准新建 SSH 连接的时长（秒）。已建立的连接不受此限（conntrack）。
+pub const KNOCK_TTL_SECS: u32 = 60;
+
+/// 敲门端口派生区间起点；端口 = 起点 + 派生值 % [`KNOCK_PORT_SPAN`]。
+pub const KNOCK_PORT_BASE: u16 = 20000;
+pub const KNOCK_PORT_SPAN: u16 = 40000;
 
 /// 端口或闭区间端口范围 `start..=end`（单端口时 `start == end`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

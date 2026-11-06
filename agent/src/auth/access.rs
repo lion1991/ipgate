@@ -23,16 +23,20 @@ fn generate(data_dir: &Path) -> Result<String> {
 /// 加载访问密钥；不存在则生成。即便当前没启用门禁也照常生成，
 /// 这样 `access-key` 子命令随时可印、用户一开 `require_access_key` 就能用。
 pub fn load_or_generate(data_dir: &Path) -> Result<String> {
-    let p = file(data_dir);
-    if p.exists() {
-        let s = std::fs::read_to_string(&p)?.trim().to_string();
-        if s.is_empty() {
-            return Err(anyhow!("access.key 为空（已损坏）；用 access-key --reset 重置"));
-        }
-        Ok(s)
+    if file(data_dir).exists() {
+        load(data_dir)
     } else {
         generate(data_dir)
     }
+}
+
+/// 只读加载访问密钥；不存在或为空时报错，不生成。
+pub fn load(data_dir: &Path) -> Result<String> {
+    let s = std::fs::read_to_string(file(data_dir))?.trim().to_string();
+    if s.is_empty() {
+        return Err(anyhow!("access.key 为空（已损坏）；用 access-key --reset 重置"));
+    }
+    Ok(s)
 }
 
 /// 强制重置访问密钥，返回新值（旧客户端需重新填入新密钥/重配对）。

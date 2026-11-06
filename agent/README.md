@@ -42,7 +42,7 @@ ipgate-agent --config <path> forwards        # 列端口转发规则（+ 当前�
 ipgate-agent --config <path> forward-add --listen 443 --dest 10.0.0.9:8443 [--proto both] [--iface eth0] [--source auto]
 ipgate-agent --config <path> forward-rm <id> # 删端口转发（按 id）
 ipgate-agent --config <path> ssh-expose --open       # SSH 端口对所有人开放（控制台救援：解除「仅名单」自锁）
-ipgate-agent --config <path> ssh-expose --allowlist  # SSH 端口仅放行名单内源 IP 可连
+ipgate-agent --config <path> ssh-expose --allowlist  # SSH 端口仅放行名单内源 IP 与敲过门的已配对设备可连（ADR 0012）
 ipgate-agent --config <path> forward-expose --allowlist  # 转发（含 Docker 映射）仅放行名单内源 IP 与公开端口（ADR 0008）
 ipgate-agent --config <path> forward-expose --open       # 转发对所有人开放（控制台救援）
 # ssh-expose / forward-expose 成功后，若服务在运行会自动 systemctl restart，免得服务内存里的旧开关把改动撤销
@@ -71,7 +71,7 @@ sudo deploy/uninstall.sh --purge # 停服务 + flush 表 + 删数据
 
 > ⚠️ default-drop 一旦生效，除 **SSH 端口（`ssh_port`，默认 22，无条件放行）**/established/放行名单/公开端口外一律拒。SSH 是唯一入口、结构性**不自锁**（ADR 0007）；其余对外服务端口请写进 `public_tcp`。
 >
-> 🔒 **SSH 仅名单可连**（可选，默认关）：客户端开关或 `ssh-expose --allowlist` 可把 22 收窄为仅放行名单内源 IP 可连（去掉无条件放行，改由 `saddr @allow` 命中）。有自锁风险——开启前先放行自己；锁死了从控制台 `ssh-expose --open` 恢复。状态存 `state.json`（`ssh_allowlist_only`）。
+> 🔒 **SSH 仅名单可连**（可选，默认关）：客户端开关或 `ssh-expose --allowlist` 可把 22 收窄为仅放行名单内源 IP 与**敲过门**的源 IP 可连（ADR 0012）。已配对客户端连接前自动往 UDP 敲门端口（由 access key 派生，`status` 可查）发一个口令包，内核把源 IP 放行 60 秒，所以换了网络的设备也能进。**云安全组须放行该 UDP 端口**。内核不支持敲门时拒绝开启。敲门也不通、名单里也没有自己时，从控制台 `ssh-expose --open` 恢复。状态存 `state.json`（`ssh_allowlist_only`）。
 >
 > 🚪 **转发名单门**（可选；代码默认关，install.sh 全新安装时开启，ADR 0008）：被 DNAT 进来的新建连接（ipgate 转发、dnat 工具、Docker `-p`）也只放行名单内源 IP 与 `public_tcp/udp`（按 DNAT 前的原端口）。不经 input，不会自锁。内核不支持时自动退回无门 ruleset，并上报未生效。状态存 `state.json`（`forward_allowlist_only`）。
 
@@ -96,7 +96,7 @@ RPC op（握手后，隧道内 JSON）：
   remove_dnat / migrate_dnat                dnat 适配（ADR 0006）
   list_interfaces                           列主机网卡（客户端下拉用）
   list_devices / revoke_device              已授权设备 / 吊销
-  get_settings / set_ssh_exposure           读取设置（SSH 暴露模式 + 端口 + sshd 密码登录态势 + 转发门意图/生效态）/ 切换 SSH 端口暴露（仅名单↔对所有人）
+  get_settings / set_ssh_exposure           读取设置（SSH 暴露模式 + 端口 + 敲门端口/生效态 + sshd 密码登录态势 + 转发门意图/生效态）/ 切换 SSH 端口暴露（仅名单↔对所有人）
   set_forward_exposure                      切换转发名单门（ADR 0008；先落内核再落盘，失败不改设置，错误附 nft 原文）
   set_ssh_password_auth / reset_root_password 开/关 sshd 密码登录（主配置顶部受管块+reload，sshd -t 校验，失败回滚）/ 重置 root 密码（chpasswd）
   whoami                                    回报对端 IP（注：SSH 隧道下为 loopback）
