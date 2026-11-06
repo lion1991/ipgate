@@ -46,8 +46,20 @@ fn element_token(target: &IpNet, expires_at: Option<DateTime<Utc>>, now: DateTim
     }
 }
 
+/// 先排序合并重叠/相邻区间：interval set 内联重叠元素会被 nft 拒（config 与客户端添加的可能重叠）。
 fn render_ports(ports: &[PortRange]) -> String {
-    ports
+    let mut sorted = ports.to_vec();
+    sorted.sort_by_key(|p| p.start);
+    let mut merged: Vec<PortRange> = Vec::new();
+    for p in sorted {
+        match merged.last_mut() {
+            Some(last) if u32::from(p.start) <= u32::from(last.end) + 1 => {
+                last.end = last.end.max(p.end)
+            }
+            _ => merged.push(p),
+        }
+    }
+    merged
         .iter()
         .map(|p| {
             if p.start == p.end {
@@ -280,6 +292,22 @@ mod tests {
         };
         let s = render_apply(&cfg, &[], Utc::now());
         assert!(s.contains("set public_tcp { type inet_service; flags interval; elements = { 443, 8000-8010 } }"));
+    }
+
+    #[test]
+    fn public_ports_overlaps_are_merged() {
+        let cfg = RulesetConfig {
+            public_tcp: vec![
+                PortRange { start: 8005, end: 8020 },
+                PortRange::single(443),
+                PortRange { start: 8000, end: 8010 },
+                PortRange::single(8021),
+                PortRange::single(443),
+            ],
+            ..RulesetConfig::default()
+        };
+        let s = render_apply(&cfg, &[], Utc::now());
+        assert!(s.contains("set public_tcp { type inet_service; flags interval; elements = { 443, 8000-8021 } }"), "{s}");
     }
 
     #[test]

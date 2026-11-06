@@ -214,7 +214,14 @@ async fn handle_conn(
                 if matches!(req, RpcRequest::Whoami) && client_ip.is_none() {
                     client_ip = Some(resolve_client_ip(local, peer, st.cfg.ssh_port).await);
                 }
-                dispatch(&st, device, client_ip.unwrap_or(peer.ip()), req)
+                if matches!(req, RpcRequest::EgressIp) {
+                    match serde_json::to_value(crate::egress::probe().await) {
+                        Ok(v) => RpcResponse::Ok(v),
+                        Err(e) => RpcResponse::Err(ApiError::new(ErrorCode::Internal, e.to_string())),
+                    }
+                } else {
+                    dispatch(&st, device, client_ip.unwrap_or(peer.ip()), req)
+                }
             }
             Err(e) => {
                 RpcResponse::Err(ApiError::new(ErrorCode::BadRequest, format!("请求解析失败：{e}")))
@@ -328,6 +335,17 @@ fn dispatch(st: &AppState, device: DeviceId, peer_ip: IpAddr, req: RpcRequest) -
             tracing::warn!(%device, "特权操作：重置 root 密码");
             handlers::reset_root_password(password)?;
             Ok(serde_json::Value::Null)
+        }
+        // 要发网络请求，由连接循环异步处理，不进这里。
+        EgressIp => Err(ApiError::new(ErrorCode::Internal, "EgressIp 须经连接循环处理")),
+        ListPublicPorts => to_val(handlers::list_public_ports(st)),
+        AddPublicPort(r) => {
+            tracing::warn!(%device, proto = ?r.proto, start = r.ports.start, end = r.ports.end, "特权操作：新增公开端口");
+            to_val(handlers::add_public_port(st, r)?)
+        }
+        RemovePublicPort { proto, ports } => {
+            tracing::info!(%device, ?proto, start = ports.start, end = ports.end, "移除公开端口");
+            to_val(handlers::remove_public_port(st, proto, ports)?)
         }
     })();
     match out {

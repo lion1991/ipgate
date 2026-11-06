@@ -2,7 +2,9 @@
 
 use crate::store::RulesetFlags;
 use anyhow::{bail, Context, Result};
-use ipgate_proto::{PortRange, RulesetConfig, DEFAULT_MGMT_PORT, DEFAULT_SSH_PORT};
+use ipgate_proto::{
+    ForwardProto, PortRange, PublicPort, RulesetConfig, DEFAULT_MGMT_PORT, DEFAULT_SSH_PORT,
+};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -81,15 +83,47 @@ impl AgentConfig {
         Ok(())
     }
 
-    /// 构造 ruleset 配置；`flags` 是运行期可调开关（存在 store），由调用方注入。
+    /// 构造 ruleset 配置；`flags` 是运行期设置（存在 store），由调用方注入。
+    /// 公开端口 = config.json 的 + 客户端添加的（重叠区间由渲染层合并）。
     pub fn ruleset_with(&self, flags: RulesetFlags) -> RulesetConfig {
+        let mut public_tcp = self.public_tcp.clone();
+        let mut public_udp = self.public_udp.clone();
+        for p in &flags.public_ports {
+            if p.proto != ForwardProto::Udp {
+                public_tcp.push(p.ports);
+            }
+            if p.proto != ForwardProto::Tcp {
+                public_udp.push(p.ports);
+            }
+        }
         RulesetConfig {
             ssh_port: self.ssh_port,
             ssh_allowlist_only: flags.ssh_allowlist_only,
             forward_allowlist_only: flags.forward_allowlist_only,
-            public_tcp: self.public_tcp.clone(),
-            public_udp: self.public_udp.clone(),
+            public_tcp,
+            public_udp,
         }
+    }
+
+    /// 覆盖 SSH 端口的 TCP 公开端口（config.json 的 + 客户端添加的）。存在时「SSH 仅名单可连」不生效。
+    pub fn public_port_covering_ssh(&self, flags: &RulesetFlags) -> Option<PublicPort> {
+        self.config_public_ports()
+            .into_iter()
+            .chain(flags.public_ports.iter().cloned())
+            .find(|p| self.covers_ssh(p.proto, p.ports))
+    }
+
+    pub fn covers_ssh(&self, proto: ForwardProto, ports: PortRange) -> bool {
+        proto != ForwardProto::Udp && ports.contains(self.ssh_port)
+    }
+
+    /// config.json 里的公开端口（只读展示用）。
+    pub fn config_public_ports(&self) -> Vec<PublicPort> {
+        let tcp = self.public_tcp.iter().map(|&r| (ForwardProto::Tcp, r));
+        let udp = self.public_udp.iter().map(|&r| (ForwardProto::Udp, r));
+        tcp.chain(udp)
+            .map(|(proto, ports)| PublicPort { proto, ports, note: String::new(), from_config: true })
+            .collect()
     }
 
     pub fn store_path(&self) -> PathBuf {
@@ -126,6 +160,24 @@ mod tests {
             ..AgentConfig::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn runtime_public_ports_merge_with_config() {
+        let c = AgentConfig { public_tcp: vec![PortRange::single(443)], ..AgentConfig::default() };
+        let p = |proto, port| PublicPort {
+            proto,
+            ports: PortRange::single(port),
+            note: String::new(),
+            from_config: false,
+        };
+        let flags = RulesetFlags {
+            public_ports: vec![p(ForwardProto::Both, 25565), p(ForwardProto::Udp, 53)],
+            ..RulesetFlags::default()
+        };
+        let r = c.ruleset_with(flags);
+        assert_eq!(r.public_tcp, vec![PortRange::single(443), PortRange::single(25565)]);
+        assert_eq!(r.public_udp, vec![PortRange::single(25565), PortRange::single(53)]);
     }
 
     #[test]

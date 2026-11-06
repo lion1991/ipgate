@@ -68,7 +68,7 @@ table inet ipgate {
 
         tcp dport 19186 accept                   # 管理端口：无条件放行(ADR 0003 不变量)，永不进名单
 
-        tcp dport @public_tcp accept             # 公开端口(如 web 80/443)，可配
+        tcp dport @public_tcp accept             # 公开端口(如 web 80/443)，config.json + 客户端添加(ADR 0011)
         udp dport @public_udp accept
 
         ip  saddr @allow4 accept                 # 放行名单：允许的源 IP 获得访问

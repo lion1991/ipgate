@@ -90,8 +90,17 @@ struct Server {
 
 /// 起一个跑在临时 loopback 端口上的 agent。
 async fn spawn() -> Server {
+    spawn_with(AgentConfig::default(), None).await
+}
+
+/// `state_json`：预置的 state.json（模拟升级前的旧部署）。
+async fn spawn_with(base: AgentConfig, state_json: Option<&str>) -> Server {
     let data_dir = std::env::temp_dir().join(format!("ipgate-e2e-{}", to_hex(&random_bytes::<8>())));
-    let cfg = AgentConfig { data_dir: data_dir.clone(), ..AgentConfig::default() };
+    let cfg = AgentConfig { data_dir: data_dir.clone(), ..base };
+    if let Some(json) = state_json {
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(cfg.store_path(), json).unwrap();
+    }
     let backend = Arc::new(MockNft::default());
     let store = Arc::new(Mutex::new(Store::load(&cfg.store_path()).unwrap()));
     let auth = AuthState::load_or_generate(&data_dir).unwrap();
@@ -605,5 +614,145 @@ async fn revoke_device_closes_live_connection() {
         .unwrap();
     assert!(cli.conn.recv().await.is_err(), "撤销后在途连接应被 agent 关闭");
 
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+fn applied_public(srv: &Server) -> (Vec<PortRange>, Vec<PortRange>) {
+    let cfg = srv.backend.applied_cfg.lock().unwrap().clone().unwrap();
+    (cfg.public_tcp, cfg.public_udp)
+}
+
+fn public_req(proto: ForwardProto, start: u16, end: u16, note: &str) -> RpcRequest {
+    RpcRequest::AddPublicPort(PublicPortRequest {
+        proto,
+        ports: PortRange { start, end },
+        note: note.into(),
+    })
+}
+
+async fn expect_code(cli: &mut Client, req: RpcRequest, code: ErrorCode) -> String {
+    match cli.rpc(req).await {
+        RpcResponse::Err(e) => {
+            assert_eq!(e.code, code, "{}", e.message);
+            e.message
+        }
+        RpcResponse::Ok(v) => panic!("应失败，实际成功：{v}"),
+    }
+}
+
+#[tokio::test]
+async fn public_ports_flow() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("x".into()) },
+    )
+    .await
+    .unwrap();
+
+    let l: Vec<PublicPort> = cli.ok(RpcRequest::ListPublicPorts).await;
+    assert!(l.is_empty());
+
+    let l: Vec<PublicPort> = cli.ok(public_req(ForwardProto::Tcp, 443, 443, " web ")).await;
+    assert_eq!(l.len(), 1);
+    assert_eq!(l[0].note, "web");
+    assert!(!l[0].from_config);
+    assert_eq!(applied_public(&srv).0, vec![PortRange::single(443)]);
+
+    // 同端口再加 = 改备注，不重复。
+    let l: Vec<PublicPort> = cli.ok(public_req(ForwardProto::Tcp, 443, 443, "https")).await;
+    assert_eq!(l.len(), 1);
+    assert_eq!(l[0].note, "https");
+
+    let _: Vec<PublicPort> = cli.ok(public_req(ForwardProto::Both, 25565, 25565, "mc")).await;
+    assert_eq!(applied_public(&srv), (
+        vec![PortRange::single(443), PortRange::single(25565)],
+        vec![PortRange::single(25565)],
+    ));
+
+    let l: Vec<PublicPort> = cli
+        .ok(RpcRequest::RemovePublicPort { proto: ForwardProto::Tcp, ports: PortRange::single(443) })
+        .await;
+    assert_eq!(l.len(), 1);
+    assert_eq!(applied_public(&srv).0, vec![PortRange::single(25565)]);
+    expect_code(
+        &mut cli,
+        RpcRequest::RemovePublicPort { proto: ForwardProto::Tcp, ports: PortRange::single(443) },
+        ErrorCode::NotFound,
+    )
+    .await;
+    expect_code(&mut cli, public_req(ForwardProto::Tcp, 0, 10, ""), ErrorCode::BadRequest).await;
+    expect_code(&mut cli, public_req(ForwardProto::Tcp, 90, 80, ""), ErrorCode::BadRequest).await;
+
+    // 内核落地失败：存储不变。
+    srv.backend.fail_apply.store(true, Ordering::SeqCst);
+    expect_code(&mut cli, public_req(ForwardProto::Udp, 53, 53, ""), ErrorCode::NftFailure).await;
+    srv.backend.fail_apply.store(false, Ordering::SeqCst);
+    let l: Vec<PublicPort> = cli.ok(RpcRequest::ListPublicPorts).await;
+    assert_eq!(l.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+#[tokio::test]
+async fn public_ports_never_override_ssh_allowlist_only() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("x".into()) },
+    )
+    .await
+    .unwrap();
+    let _: Entry = cli
+        .ok(RpcRequest::Allow(AllowRequest {
+            target: "203.0.113.7/32".parse().unwrap(),
+            note: "me".into(),
+            expires_at: None,
+        }))
+        .await;
+
+    // SSH 仅名单时：覆盖 22 的 TCP 公开端口被拒；UDP 不影响 SSH，允许。
+    let _: AgentSettings = cli.ok(RpcRequest::SetSshExposure { allowlist_only: true }).await;
+    let msg = expect_code(&mut cli, public_req(ForwardProto::Both, 20, 30, ""), ErrorCode::BadRequest).await;
+    assert!(msg.contains("安全"), "{msg}");
+    let _: Vec<PublicPort> = cli.ok(public_req(ForwardProto::Udp, 22, 22, "")).await;
+
+    // SSH 对全网开放时可以加 22；之后再开「仅名单」被拒（否则开关显示开、实际仍全网可连）。
+    let _: AgentSettings = cli.ok(RpcRequest::SetSshExposure { allowlist_only: false }).await;
+    let _: Vec<PublicPort> = cli.ok(public_req(ForwardProto::Tcp, 22, 22, "")).await;
+    expect_code(&mut cli, RpcRequest::SetSshExposure { allowlist_only: true }, ErrorCode::BadRequest).await;
+    let s: AgentSettings = cli.ok(RpcRequest::GetSettings).await;
+    assert!(!s.ssh_allowlist_only);
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+#[tokio::test]
+async fn legacy_config_ssh_overlap_does_not_block_unrelated_public_ports() {
+    // 旧部署：config.json 公开 1-1024（含 22）且已开 SSH 仅名单——升级前两者可共存。
+    let srv = spawn_with(
+        AgentConfig { public_tcp: vec![PortRange { start: 1, end: 1024 }], ..AgentConfig::default() },
+        Some(r#"{"entries":[],"devices":[],"revision":0,"ssh_allowlist_only":true}"#),
+    )
+    .await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("x".into()) },
+    )
+    .await
+    .unwrap();
+    let s: AgentSettings = cli.ok(RpcRequest::GetSettings).await;
+    assert!(s.ssh_allowlist_only);
+    let l: Vec<PublicPort> = cli.ok(RpcRequest::ListPublicPorts).await;
+    assert!(l[0].from_config);
+    let _: Vec<PublicPort> = cli.ok(public_req(ForwardProto::Tcp, 8080, 8080, "")).await;
+    // 新增的覆盖 22 照样拒。
+    expect_code(&mut cli, public_req(ForwardProto::Tcp, 22, 22, ""), ErrorCode::BadRequest).await;
     let _ = std::fs::remove_dir_all(&srv.data_dir);
 }

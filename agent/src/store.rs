@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use ipgate_proto::{
     AddForwardRequest, AllowRequest, Device, DeviceId, Entry, EntryId, ForwardId, ForwardRule,
-    NoisePublicKey,
+    NoisePublicKey, PublicPort,
 };
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -55,13 +55,17 @@ pub struct State {
     /// 客户端可经 `SetForwardExposure` 切换。
     #[serde(default)]
     pub forward_allowlist_only: bool,
+    /// 客户端添加的公开端口（与 config.json 里的合并落地）。
+    #[serde(default)]
+    pub public_ports: Vec<PublicPort>,
 }
 
-/// ruleset 的运行期开关（存 store），由 [`crate::config::AgentConfig::ruleset_with`] 注入渲染。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// ruleset 的运行期设置（存 store），由 [`crate::config::AgentConfig::ruleset_with`] 注入渲染。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RulesetFlags {
     pub ssh_allowlist_only: bool,
     pub forward_allowlist_only: bool,
+    pub public_ports: Vec<PublicPort>,
 }
 
 pub struct Store {
@@ -171,7 +175,16 @@ impl Store {
         RulesetFlags {
             ssh_allowlist_only: self.state.ssh_allowlist_only,
             forward_allowlist_only: self.state.forward_allowlist_only,
+            public_ports: self.state.public_ports.clone(),
         }
+    }
+
+    pub fn public_ports(&self) -> &[PublicPort] {
+        &self.state.public_ports
+    }
+
+    pub fn set_public_ports(&mut self, ports: Vec<PublicPort>) {
+        self.state.public_ports = ports;
     }
 
     /// 设置转发名单门；返回是否发生了变化。
@@ -464,7 +477,7 @@ mod tests {
         let s = Store::load(&p).unwrap();
         assert_eq!(
             s.ruleset_flags(),
-            RulesetFlags { ssh_allowlist_only: true, forward_allowlist_only: false }
+            RulesetFlags { ssh_allowlist_only: true, ..RulesetFlags::default() }
         );
         let _ = std::fs::remove_file(&p);
     }
