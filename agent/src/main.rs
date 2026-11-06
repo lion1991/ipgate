@@ -7,6 +7,7 @@ mod api;
 mod auth;
 mod config;
 mod dnat;
+mod egress;
 mod forward;
 mod netinfo;
 mod nft;
@@ -788,6 +789,17 @@ fn ssh_expose_cli(cfg: &AgentConfig, open: bool, allowlist: bool) -> Result<()> 
         _ => anyhow::bail!("请二选一指定 --open（对所有人开放）或 --allowlist（仅放行名单）"),
     };
     let mut store = Store::load(&cfg.store_path())?;
+    if on {
+        if let Some(p) = cfg.public_port_covering_ssh(&store.ruleset_flags()) {
+            let src = if p.from_config { "config.json" } else { "客户端添加" };
+            anyhow::bail!(
+                "公开端口 {}-{}（{src}）包含 SSH 端口 {}，开启仅名单不会生效。请先移除该公开端口。",
+                p.ports.start,
+                p.ports.end,
+                cfg.ssh_port
+            );
+        }
+    }
     store.set_ssh_allowlist_only(on);
     store.save()?;
     // 直接落内核（救援场景：可能没有运行中的服务来对账）。
@@ -860,6 +872,10 @@ fn status(cfg: &AgentConfig) -> Result<()> {
         if flags.ssh_allowlist_only { "仅名单" } else { "对所有人开放" },
         if flags.forward_allowlist_only { "开（转发仅名单/公开端口）" } else { "关（转发对所有人开放）" },
     );
+    for p in cfg.config_public_ports().iter().chain(store.public_ports()) {
+        let src = if p.from_config { "config.json" } else { "客户端添加" };
+        println!("  公开端口 {:?} {}-{} [{}] {src}", p.proto, p.ports.start, p.ports.end, p.note);
+    }
     for e in store.entries() {
         let exp = e
             .expires_at

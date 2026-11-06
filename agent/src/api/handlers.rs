@@ -13,8 +13,8 @@ use chrono::Utc;
 use ipgate_proto::{
     validate_ports, AddForwardRequest, AgentSettings, AllowRequest, Allowlist, ApiError, Device,
     DeviceId, Diff, Entry, ErrorCode, ForwardCaps, ForwardId, ForwardOrigin, ForwardRule,
-    ForwardView, InterfaceInfo, RevokeRequest, UnifiedForwardList, UnifiedForwardView,
-    WhoamiResponse,
+    ForwardProto, ForwardView, InterfaceInfo, PortRange, PublicPort, PublicPortRequest,
+    RevokeRequest, UnifiedForwardList, UnifiedForwardView, WhoamiResponse,
 };
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
@@ -137,11 +137,102 @@ pub fn set_ssh_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<AgentS
         // 不重渲染链，故此变更落地后不会被它 revert（仅 list() 失败时的兜底重建会读 store 同步本值）。
         // 先落内核再落盘：apply 失败时内核仍是旧表，设置也不变。
         let flags = RulesetFlags { ssh_allowlist_only: allowlist_only, ..store.ruleset_flags() };
+        if allowlist_only {
+            if let Some(p) = st.cfg.public_port_covering_ssh(&flags) {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "公开端口 {} 包含 SSH 端口 {}，开启「仅名单可连」不会生效。请先移除该公开端口{}。",
+                        port_label(p.ports),
+                        st.cfg.ssh_port,
+                        if p.from_config { "（它来自主机的 config.json，需在主机上改配置文件）" } else { "" },
+                    ),
+                ));
+            }
+        }
         reapply_ruleset(st, flags, store.entries())?;
         store.set_ssh_allowlist_only(allowlist_only);
         store.save().map_err(internal)?;
     }
     Ok(build_settings(st))
+}
+
+// ---- 公开端口（对全部 IP 放行）----
+
+fn port_label(p: PortRange) -> String {
+    if p.start == p.end {
+        p.start.to_string()
+    } else {
+        format!("{}-{}", p.start, p.end)
+    }
+}
+
+pub fn list_public_ports(st: &AppState) -> Vec<PublicPort> {
+    let mut out = st.cfg.config_public_ports();
+    out.extend(st.store.lock_safe().public_ports().iter().cloned());
+    out
+}
+
+/// 新增公开端口：先落内核再落盘，失败不改存储。已有同 `(proto, ports)` 时只改备注。
+///
+/// SSH 已「仅名单可连」时拒绝覆盖 SSH 端口——SSH 暴露只在「安全」里管，两处设置不互相打架。
+pub fn add_public_port(st: &AppState, req: PublicPortRequest) -> ApiResult<Vec<PublicPort>> {
+    if req.ports.start == 0 || !req.ports.is_valid() {
+        return Err(ApiError::new(ErrorCode::BadRequest, "端口须在 1–65535 之间，且起始不大于结束"));
+    }
+    let note = req.note.trim().to_string();
+    {
+        let mut store = st.store.lock_safe();
+        let mut ports = store.public_ports().to_vec();
+        if let Some(p) = ports.iter_mut().find(|p| p.proto == req.proto && p.ports == req.ports) {
+            p.note = note;
+        } else {
+            ports.push(PublicPort { proto: req.proto, ports: req.ports, note, from_config: false });
+            let flags = RulesetFlags { public_ports: ports.clone(), ..store.ruleset_flags() };
+            // 只看这次新增的：config.json 里遗留的冲突不该拦无关端口。
+            if flags.ssh_allowlist_only && st.cfg.covers_ssh(req.proto, req.ports) {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "SSH 已设为「仅名单可连」，不能把 SSH 端口 {} 设为公开端口。要对全网开放 SSH，请在「安全」中关闭「仅名单可连」。",
+                        st.cfg.ssh_port
+                    ),
+                ));
+            }
+            reapply_ruleset(st, flags, store.entries())?;
+        }
+        store.set_public_ports(ports);
+        store.save().map_err(internal)?;
+    }
+    Ok(list_public_ports(st))
+}
+
+/// 移除客户端添加的公开端口；config.json 里的不在存储中，报 NotFound 并说明去处。
+pub fn remove_public_port(
+    st: &AppState,
+    proto: ForwardProto,
+    range: PortRange,
+) -> ApiResult<Vec<PublicPort>> {
+    {
+        let mut store = st.store.lock_safe();
+        let mut ports = store.public_ports().to_vec();
+        let before = ports.len();
+        ports.retain(|p| !(p.proto == proto && p.ports == range));
+        if ports.len() == before {
+            let in_config = st.cfg.config_public_ports().iter().any(|p| p.proto == proto && p.ports == range);
+            let msg = if in_config {
+                "该公开端口来自主机的 config.json，需在主机上改配置文件后重启 agent"
+            } else {
+                "公开端口不存在"
+            };
+            return Err(ApiError::new(ErrorCode::NotFound, msg));
+        }
+        let flags = RulesetFlags { public_ports: ports.clone(), ..store.ruleset_flags() };
+        reapply_ruleset(st, flags, store.entries())?;
+        store.set_public_ports(ports);
+        store.save().map_err(internal)?;
+    }
+    Ok(list_public_ports(st))
 }
 
 /// 切换转发名单门（ADR 0008）并整表重建 ruleset。

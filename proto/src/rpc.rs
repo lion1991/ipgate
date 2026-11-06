@@ -5,7 +5,8 @@
 //! 信封做请求-响应。每个 op 对应原 REST 路由的语义（注释里标了旧路由）。
 
 use crate::{
-    AddForwardRequest, AllowRequest, ApiError, DeviceId, ForwardId, PairingCode, RevokeRequest,
+    AddForwardRequest, AllowRequest, ApiError, DeviceId, ForwardId, ForwardProto, PairingCode,
+    PortRange, PublicPortRequest, RevokeRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -90,6 +91,14 @@ pub enum RpcRequest {
     SetSshPasswordAuth { enabled: bool },
     /// 重置 root 用户密码（chpasswd，明文经 Noise 隧道传输、走 stdin 不进 argv/日志）。无返回值。
     ResetRootPassword { password: String },
+    /// 主机自己的公网出口 IP → [`crate::EgressIp`]。
+    EgressIp,
+    /// 公开端口（对全部 IP 放行）→ `Vec<`[`crate::PublicPort`]`>`，含 config.json 里的只读项。
+    ListPublicPorts,
+    /// 新增公开端口并整表重建 ruleset，返回最新列表。
+    AddPublicPort(PublicPortRequest),
+    /// 移除客户端添加的公开端口（config.json 里的删不掉），返回最新列表。
+    RemovePublicPort { proto: ForwardProto, ports: PortRange },
 }
 
 /// agent 可由客户端查看/调节的运行期设置（ADR 0007）。

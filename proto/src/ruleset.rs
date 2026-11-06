@@ -68,6 +68,36 @@ impl PortRange {
     }
 }
 
+/// 公开端口：对全世界放行的端口/区间（不看源 IP），落地进 `public_tcp` / `public_udp` set。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicPort {
+    pub proto: crate::ForwardProto,
+    pub ports: PortRange,
+    #[serde(default)]
+    pub note: String,
+    /// 来自 agent 的 `config.json`（只读，客户端删不掉）；false = 客户端经 RPC 添加。
+    #[serde(default)]
+    pub from_config: bool,
+}
+
+/// 新增公开端口；同 `(proto, ports)` 已存在时只更新备注。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicPortRequest {
+    pub proto: crate::ForwardProto,
+    pub ports: PortRange,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// 主机自己往外连时的公网出口 IP（agent 经公网 echo 服务探测）。探不到的一族为 `None`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressIp {
+    #[serde(default)]
+    pub ipv4: Option<std::net::Ipv4Addr>,
+    #[serde(default)]
+    pub ipv6: Option<std::net::Ipv6Addr>,
+}
+
 /// 内核 set 中的一个元素（由 `nft -j list set` 解析得到）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KernelElement {
