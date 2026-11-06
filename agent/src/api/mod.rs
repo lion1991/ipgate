@@ -21,7 +21,6 @@ use ipgate_proto::{
     RpcResponse,
 };
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -90,8 +89,8 @@ pub struct AppState {
     pub dnat: Arc<DnatAdapter>,
     /// per-IP 限流器。loopback+SSH 模型下主要给（未来的）直连兜底。
     pub rate: Arc<RateLimiter>,
-    /// 转发名单门是否实际生效（ADR 0008）；每次整表 apply 后回写，对账线程共享。
-    pub forward_gate_active: Arc<AtomicBool>,
+    /// 转发名单门 / SSH 敲门是否实际生效（ADR 0008 / 0012）；每次整表 apply 后回写，对账线程共享。
+    pub live: Arc<crate::nft::Live>,
 }
 
 /// 启动 Noise JSON-RPC 服务（loopback only，阻塞直到出错）。

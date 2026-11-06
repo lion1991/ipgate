@@ -43,6 +43,9 @@ pub const NFT_SET_ALLOW6: &str = "allow6";
 pub const NFT_SET_PUBLIC_TCP: &str = "public_tcp";
 /// 对全世界开放的 UDP 端口 set 名。
 pub const NFT_SET_PUBLIC_UDP: &str = "public_udp";
+/// 刚敲过门、获准连 SSH 的源 IP（ADR 0012，内核动态写入、带超时）。
+pub const NFT_SET_KNOCK4: &str = "knock4";
+pub const NFT_SET_KNOCK6: &str = "knock6";
 
 /// 端口转发用的**独立** nftables 表（`ip` family，仅 IPv4）。
 ///

@@ -35,7 +35,6 @@ use ipnet::IpNet;
 use nft::{NatBackend, NftBackend, NftCli};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use store::{LockExt, Store};
@@ -180,6 +179,15 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = AgentConfig::load(&cli.config)?;
+    // 要整表落 ruleset 的命令带上敲门参数（ADR 0012）；其余命令不必读 access key。
+    let cfg = match &cli.cmd {
+        // 开「仅名单」必须有敲门参数，否则会落下不带敲门的「仅名单」。
+        Cmd::Run { .. } | Cmd::SshExpose { allowlist: true, .. } => cfg.with_knock()?,
+        Cmd::SshExpose { .. } | Cmd::ForwardExpose { .. } | Cmd::PrintRuleset | Cmd::Status => {
+            cfg.try_with_knock()
+        }
+        _ => cfg,
+    };
 
     match cli.cmd {
         Cmd::Run { interval } => run(cfg, interval)?,
@@ -671,14 +679,14 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
     let store = Arc::new(Mutex::new(Store::load(&cfg.store_path())?));
 
     // 启动即清过期 + 全量原子重建（坐实 default-drop 与管理端口放行不变量）。
-    let forward_gate_active = {
+    let live = Arc::new(nft::Live::default());
+    {
         let mut s = store.lock_safe();
         if !s.prune_expired(Utc::now()).is_empty() {
             s.save()?;
         }
-        nft::apply_ruleset(&*backend, &cfg.ruleset_with(s.ruleset_flags()), s.entries())?.active()
-    };
-    let forward_gate_active = Arc::new(AtomicBool::new(forward_gate_active));
+        live.record(&nft::apply_ruleset(&*backend, &cfg.ruleset_with(s.ruleset_flags()), s.entries())?);
+    }
     info!("ruleset 已应用");
 
     // 端口转发：启动期解析 + 落地一次（独立 `ip ipgate_nat` 表，与上面互不相干）。
@@ -703,8 +711,8 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
     // 后台对账线程（阻塞式，独立于 async server）。
     {
         let (store, backend, cfg) = (store.clone(), backend.clone(), cfg.clone());
-        let gate = forward_gate_active.clone();
-        std::thread::spawn(move || reconcile_loop(cfg, store, backend, gate, interval));
+        let live = live.clone();
+        std::thread::spawn(move || reconcile_loop(cfg, store, backend, live, interval));
     }
     // 端口转发周期重解析线程（域名 IP 漂移自愈，独立于对账）。
     {
@@ -725,7 +733,7 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
             cfg.rate_limit_per_min,
             Duration::from_secs(60),
         )),
-        forward_gate_active,
+        live,
     };
     info!(%addr, "启动 Noise JSON-RPC 服务（仅 loopback；经 SSH 隧道访问）");
 
@@ -737,7 +745,7 @@ fn reconcile_loop(
     cfg: Arc<AgentConfig>,
     store: Arc<Mutex<Store>>,
     backend: Arc<dyn NftBackend + Send + Sync>,
-    forward_gate_active: Arc<AtomicBool>,
+    live: Arc<nft::Live>,
     interval: u64,
 ) {
     loop {
@@ -773,8 +781,8 @@ fn reconcile_loop(
                 warn!(error = %e, "对账读取内核失败，全量重建");
                 // 持锁重建：开关取此刻最新值，并与 RPC 开关的「apply + 落盘」串行，不会用过期开关覆盖。
                 let s = store.lock_safe();
-                if let Ok(gate) = nft::apply_ruleset(&*backend, &cfg.ruleset_with(s.ruleset_flags()), s.entries()) {
-                    forward_gate_active.store(gate.active(), Ordering::SeqCst);
+                if let Ok(applied) = nft::apply_ruleset(&*backend, &cfg.ruleset_with(s.ruleset_flags()), s.entries()) {
+                    live.record(&applied);
                 }
             }
         }
@@ -800,12 +808,19 @@ fn ssh_expose_cli(cfg: &AgentConfig, open: bool, allowlist: bool) -> Result<()> 
             );
         }
     }
+    let before = store.ruleset_flags();
     store.set_ssh_allowlist_only(on);
-    store.save()?;
     // 直接落内核（救援场景：可能没有运行中的服务来对账）。
-    nft::apply_ruleset(&NftCli::new(), &cfg.ruleset_with(store.ruleset_flags()), store.entries())?;
+    let applied = nft::apply_ruleset(&NftCli::new(), &cfg.ruleset_with(store.ruleset_flags()), store.entries())?;
+    if let nft::Gate::Rejected(e) = applied.knock {
+        // 与 RPC 一致：没有敲门的「仅名单」会挡住常换网络的设备，恢复原 ruleset、不落盘。
+        nft::apply_ruleset(&NftCli::new(), &cfg.ruleset_with(before), store.entries())?;
+        anyhow::bail!("SSH 敲门规则加载失败，SSH 保持原状（常见原因：内核/nft 不支持 @th 载荷匹配或动态 set）：{e}");
+    }
+    store.save()?;
     if on {
-        println!("已设为：SSH 端口仅放行名单内源 IP 可连。");
+        let port = cfg.ssh_knock.as_ref().map(|k| k.port).unwrap_or_default();
+        println!("已设为：SSH 端口仅放行名单内源 IP 与敲过门的已配对设备可连（敲门端口 UDP {port}，云安全组须放行）。");
     } else {
         println!("已设为：SSH 端口对所有人开放。");
     }
@@ -824,7 +839,7 @@ fn forward_expose_cli(cfg: &AgentConfig, open: bool, allowlist: bool) -> Result<
     store.set_forward_allowlist_only(on);
     let gate =
         nft::apply_ruleset(&NftCli::new(), &cfg.ruleset_with(store.ruleset_flags()), store.entries())?;
-    if let nft::Gate::Rejected(e) = gate {
+    if let nft::Gate::Rejected(e) = gate.gate {
         // 内核已退回无门 ruleset：不落盘开关，免得存储与内核不一致。
         anyhow::bail!(
             "转发名单门加载失败，转发保持对全网开放（常见原因：内核/nft 不支持 ct status / ct original 匹配）：{e:#}"
@@ -872,6 +887,9 @@ fn status(cfg: &AgentConfig) -> Result<()> {
         if flags.ssh_allowlist_only { "仅名单" } else { "对所有人开放" },
         if flags.forward_allowlist_only { "开（转发仅名单/公开端口）" } else { "关（转发对所有人开放）" },
     );
+    if let Some(k) = &cfg.ssh_knock {
+        println!("SSH 敲门端口：UDP {}（仅名单时生效；云安全组须放行）", k.port);
+    }
     for p in cfg.config_public_ports().iter().chain(store.public_ports()) {
         let src = if p.from_config { "config.json" } else { "客户端添加" };
         println!("  公开端口 {:?} {}-{} [{}] {src}", p.proto, p.ports.start, p.ports.end, p.note);

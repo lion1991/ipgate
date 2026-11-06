@@ -3,7 +3,8 @@
 use crate::store::RulesetFlags;
 use anyhow::{bail, Context, Result};
 use ipgate_proto::{
-    ForwardProto, PortRange, PublicPort, RulesetConfig, DEFAULT_MGMT_PORT, DEFAULT_SSH_PORT,
+    ForwardProto, PortRange, PublicPort, RulesetConfig, SshKnock, DEFAULT_MGMT_PORT,
+    DEFAULT_SSH_PORT,
 };
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -35,6 +36,10 @@ pub struct AgentConfig {
     pub rate_limit_per_min: u32,
     /// dnat 适配（ADR 0006，排空模型）：统一查看/删除本机 dnat 规则；新增走 native。默认关。
     pub dnat: crate::dnat::DnatAdapterConfig,
+    /// SSH 敲门参数（ADR 0012），由 access key 派生、不进 config.json。要落 ruleset 的命令
+    /// 经 [`Self::with_knock`] 填入；为 `None` 时「仅名单」不带敲门。
+    #[serde(skip)]
+    pub ssh_knock: Option<SshKnock>,
 }
 
 impl Default for AgentConfig {
@@ -51,6 +56,7 @@ impl Default for AgentConfig {
             require_access_key: false,
             rate_limit_per_min: 120,
             dnat: crate::dnat::DnatAdapterConfig::default(),
+            ssh_knock: None,
         }
     }
 }
@@ -65,6 +71,24 @@ impl AgentConfig {
         } else {
             Ok(Self::default())
         }
+    }
+
+    /// 读 access key（不存在则生成）派生敲门参数。
+    pub fn with_knock(mut self) -> Result<Self> {
+        let key = crate::auth::access::load_or_generate(&self.data_dir)?;
+        self.ssh_knock = Some(crate::auth::derive_knock(&key));
+        Ok(self)
+    }
+
+    /// 只读、尽力派生敲门参数：救援 / 审计命令不能被损坏的 access.key 卡住，也不该顺手生成它。
+    pub fn try_with_knock(mut self) -> Self {
+        match crate::auth::access::load(&self.data_dir) {
+            Ok(key) => self.ssh_knock = Some(crate::auth::derive_knock(&key)),
+            Err(e) => eprintln!(
+                "警告：读不到 access.key（{e:#}），本次不带 SSH 敲门规则——SSH 若为「仅名单」，只有名单内 IP 能连。"
+            ),
+        }
+        self
     }
 
     /// 校验不变量：管理端口不能为 0，否则会把自己锁死（ADR 0002/0003）。
@@ -99,6 +123,7 @@ impl AgentConfig {
         RulesetConfig {
             ssh_port: self.ssh_port,
             ssh_allowlist_only: flags.ssh_allowlist_only,
+            ssh_knock: self.ssh_knock.clone(),
             forward_allowlist_only: flags.forward_allowlist_only,
             public_tcp,
             public_udp,

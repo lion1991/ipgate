@@ -24,6 +24,8 @@ struct MockNft {
     applied_cfg: Mutex<Option<RulesetConfig>>,
     /// 模拟老内核/老 nft 不认转发名单门的表达式。
     reject_gate: std::sync::atomic::AtomicBool,
+    /// 模拟老内核/老 nft 不认敲门规则（`@th` 载荷匹配 / 动态 set）。
+    reject_knock: std::sync::atomic::AtomicBool,
     /// 模拟与门无关的 nft 故障：任何整表 apply 都失败（内核保持旧表）。
     fail_apply: std::sync::atomic::AtomicBool,
 }
@@ -35,6 +37,9 @@ impl NftBackend for MockNft {
         }
         if cfg.forward_allowlist_only && self.reject_gate.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("Error: syntax error, unexpected status");
+        }
+        if cfg.knock().is_some() && self.reject_knock.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("Error: syntax error, unexpected @");
         }
         *self.set.lock().unwrap() = entries.iter().map(|e| e.target).collect();
         *self.applied_cfg.lock().unwrap() = Some(cfg.clone());
@@ -96,7 +101,7 @@ async fn spawn() -> Server {
 /// `state_json`：预置的 state.json（模拟升级前的旧部署）。
 async fn spawn_with(base: AgentConfig, state_json: Option<&str>) -> Server {
     let data_dir = std::env::temp_dir().join(format!("ipgate-e2e-{}", to_hex(&random_bytes::<8>())));
-    let cfg = AgentConfig { data_dir: data_dir.clone(), ..base };
+    let cfg = AgentConfig { data_dir: data_dir.clone(), ..base }.with_knock().unwrap();
     if let Some(json) = state_json {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(cfg.store_path(), json).unwrap();
@@ -114,7 +119,7 @@ async fn spawn_with(base: AgentConfig, state_json: Option<&str>) -> Server {
         nat: Arc::new(MockNat::default()),
         dnat: Arc::new(crate::dnat::DnatAdapter::new(crate::dnat::DnatAdapterConfig::default())),
         rate: Arc::new(RateLimiter::new(120, std::time::Duration::from_secs(60))),
-        forward_gate_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        live: Arc::new(crate::nft::Live::default()),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -413,14 +418,94 @@ async fn ssh_exposure_toggle_flow() {
         .await;
     let s: AgentSettings = cli.ok(RpcRequest::SetSshExposure { allowlist_only: true }).await;
     assert!(s.ssh_allowlist_only);
+    // 敲门随「仅名单」一起落地（ADR 0012），端口由 access key 派生、与 agent 自己算的一致。
+    let knock = crate::auth::derive_knock(&AuthState::load_or_generate(&srv.data_dir).unwrap().access_key);
+    assert_eq!((s.ssh_knock_port, s.ssh_knock_active), (Some(knock.port), Some(true)));
+    assert_eq!(applied_knock(&srv), Some(knock));
 
     // 持久化生效：重读为开。
     let s: AgentSettings = cli.ok(RpcRequest::GetSettings).await;
     assert!(s.ssh_allowlist_only);
 
-    // 关回开放（任何时候都允许，不受名单约束）。
+    // 关回开放（任何时候都允许，不受名单约束）；敲门不再渲染。
     let s: AgentSettings = cli.ok(RpcRequest::SetSshExposure { allowlist_only: false }).await;
     assert!(!s.ssh_allowlist_only);
+    assert_eq!(s.ssh_knock_active, Some(false));
+    assert_eq!(applied_knock(&srv), None);
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+/// 最近一次整表 apply 实际渲染的敲门参数（`None` = 没有敲门规则）。
+fn applied_knock(srv: &Server) -> Option<SshKnock> {
+    srv.backend.applied_cfg.lock().unwrap().as_ref().unwrap().knock().cloned()
+}
+
+/// 内核不认敲门时开启「仅名单」：报错、恢复原 ruleset、不改设置——没有敲门的「仅名单」
+/// 会把常换网络的设备挡在外（ADR 0012 决策 7）。
+#[tokio::test]
+async fn ssh_allowlist_only_refused_when_kernel_rejects_knock() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("x".into()) },
+    )
+    .await
+    .unwrap();
+    let _: Entry = cli
+        .ok(RpcRequest::Allow(AllowRequest {
+            target: "203.0.113.7/32".parse().unwrap(),
+            note: "me".into(),
+            expires_at: None,
+        }))
+        .await;
+    srv.backend.reject_knock.store(true, Ordering::SeqCst);
+
+    expect_nft_failure(&mut cli, RpcRequest::SetSshExposure { allowlist_only: true }).await;
+    let s: AgentSettings = cli.ok(RpcRequest::GetSettings).await;
+    assert!(!s.ssh_allowlist_only);
+    assert_eq!(s.ssh_knock_active, Some(false));
+    let applied = srv.backend.applied_cfg.lock().unwrap().clone().unwrap();
+    assert!(!applied.ssh_allowlist_only, "内核须恢复为 SSH 对全网开放");
+
+    // 内核支持后再开 → 生效。
+    srv.backend.reject_knock.store(false, Ordering::SeqCst);
+    let s: AgentSettings = cli.ok(RpcRequest::SetSshExposure { allowlist_only: true }).await;
+    assert_eq!((s.ssh_allowlist_only, s.ssh_knock_active), (true, Some(true)));
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+/// 已开「仅名单」后内核不再认敲门（如换了内核）：其他整表重建照常完成，保留「仅名单」
+/// （不悄悄放开 SSH），上报敲门未生效。
+#[tokio::test]
+async fn knock_lost_on_rebuild_keeps_allowlist_only() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("x".into()) },
+    )
+    .await
+    .unwrap();
+    let _: Entry = cli
+        .ok(RpcRequest::Allow(AllowRequest {
+            target: "203.0.113.7/32".parse().unwrap(),
+            note: "me".into(),
+            expires_at: None,
+        }))
+        .await;
+    let _: AgentSettings = cli.ok(RpcRequest::SetSshExposure { allowlist_only: true }).await;
+    srv.backend.reject_knock.store(true, Ordering::SeqCst);
+
+    let s: AgentSettings = cli.ok(RpcRequest::SetForwardExposure { allowlist_only: true }).await;
+    assert_eq!((s.ssh_allowlist_only, s.ssh_knock_active), (true, Some(false)));
+    assert_eq!(s.forward_gate_active, Some(true));
+    let applied = srv.backend.applied_cfg.lock().unwrap().clone().unwrap();
+    assert!(applied.ssh_allowlist_only && applied.knock().is_none());
 
     let _ = std::fs::remove_dir_all(&srv.data_dir);
 }

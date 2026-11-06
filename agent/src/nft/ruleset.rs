@@ -2,8 +2,8 @@
 
 use chrono::{DateTime, Utc};
 use ipgate_proto::{
-    Entry, PortRange, RulesetConfig, NFT_SET_ALLOW4, NFT_SET_ALLOW6, NFT_SET_PUBLIC_TCP,
-    NFT_SET_PUBLIC_UDP, NFT_TABLE,
+    Entry, PortRange, RulesetConfig, KNOCK_TTL_SECS, NFT_SET_ALLOW4, NFT_SET_ALLOW6,
+    NFT_SET_KNOCK4, NFT_SET_KNOCK6, NFT_SET_PUBLIC_TCP, NFT_SET_PUBLIC_UDP, NFT_TABLE,
 };
 use ipnet::IpNet;
 
@@ -125,6 +125,12 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
     ));
     s.push_str(&set_def(NFT_SET_PUBLIC_TCP, "inet_service", "interval", &tcp));
     s.push_str(&set_def(NFT_SET_PUBLIC_UDP, "inet_service", "interval", &udp));
+    let knock = cfg.knock();
+    if knock.is_some() {
+        // 由下方敲门规则在包路径上动态写入（ADR 0012）；整表重建会清空，已建立连接不受影响。
+        s.push_str(&set_def(NFT_SET_KNOCK4, "ipv4_addr", "dynamic, timeout", ""));
+        s.push_str(&set_def(NFT_SET_KNOCK6, "ipv6_addr", "dynamic, timeout", ""));
+    }
     s.push_str("    chain input {\n");
     // 用数字 priority 0（= filter），兼容老版本 nft（命名优先级 0.9+ 才支持）。
     s.push_str("        type filter hook input priority 0; policy drop;\n");
@@ -139,14 +145,39 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
     s.push_str(&format!(
         "        ip protocol icmp icmp type {{ {ICMP_INFRA_TYPES} }} accept\n"
     ));
+    // 敲门（ADR 0012）：载荷前 16 字节等于口令 → 记下源 IP 并丢弃，不回应。只丢口令匹配的包，
+    // 派生端口撞上真实 UDP 服务时其余包照常往下走。
+    if let Some(k) = knock {
+        let m = format!(
+            "udp dport {} @th,64,128 0x{}",
+            k.port,
+            crate::util::to_hex(&k.token)
+        );
+        s.push_str(&format!(
+            "        meta nfproto ipv4 {m} update @{NFT_SET_KNOCK4} {{ ip saddr timeout {KNOCK_TTL_SECS}s }} drop\n"
+        ));
+        s.push_str(&format!(
+            "        meta nfproto ipv6 {m} update @{NFT_SET_KNOCK6} {{ ip6 saddr timeout {KNOCK_TTL_SECS}s }} drop\n"
+        ));
+    }
     // SSH 管理端口（ADR 0007 唯一入口）。默认无条件放行（自锁不变量，最稳）；开启
-    // ssh_allowlist_only 后去掉这条——SSH 改由下方 `ip saddr @allow accept` 命中，即仅
-    // 名单内源 IP 可连（含管理隧道）。Noise 服务仅 loopback，命中上面 `iif lo accept`。
+    // ssh_allowlist_only 后去掉这条——SSH 改由下方 `ip saddr @allow accept` 命中（名单内源 IP），
+    // 以及刚敲过门的源 IP。Noise 服务仅 loopback，命中上面 `iif lo accept`。
     if cfg.ssh_allowlist_only {
         s.push_str(&format!(
             "        # ssh dport {} 仅名单可连（见末尾 saddr 规则）\n",
             cfg.ssh_port
         ));
+        if knock.is_some() {
+            s.push_str(&format!(
+                "        tcp dport {} ip saddr @{NFT_SET_KNOCK4} accept\n",
+                cfg.ssh_port
+            ));
+            s.push_str(&format!(
+                "        tcp dport {} ip6 saddr @{NFT_SET_KNOCK6} accept\n",
+                cfg.ssh_port
+            ));
+        }
     } else {
         s.push_str(&format!("        tcp dport {} accept\n", cfg.ssh_port));
     }
@@ -328,6 +359,49 @@ mod tests {
         // 仍保持 default-drop 与 loopback 不变量。
         assert!(s.contains("policy drop;"));
         assert!(s.contains("iif lo accept"));
+    }
+
+    fn knock_cfg(ssh_allowlist_only: bool) -> RulesetConfig {
+        RulesetConfig {
+            ssh_allowlist_only,
+            ssh_knock: Some(ipgate_proto::SshKnock { port: 44707, token: [0xab; 16] }),
+            ..RulesetConfig::default()
+        }
+    }
+
+    #[test]
+    fn knock_rendered_only_when_ssh_allowlist_only() {
+        let open = render_apply(&knock_cfg(false), &[], Utc::now());
+        assert!(!open.contains("knock"), "SSH 对全网开放时不渲染敲门：{open}");
+        assert!(open.contains("tcp dport 22 accept"));
+
+        let s = render_apply(&knock_cfg(true), &[], Utc::now());
+        let tok = "ab".repeat(16);
+        assert!(s.contains("set knock4 { type ipv4_addr; flags dynamic, timeout; }"));
+        assert!(s.contains("set knock6 { type ipv6_addr; flags dynamic, timeout; }"));
+        let lines: Vec<&str> = s.lines().map(str::trim).collect();
+        let at = |l: &str| lines.iter().position(|x| *x == l).unwrap_or_else(|| panic!("缺少 `{l}`：{s}"));
+        let k4 = at(&format!("meta nfproto ipv4 udp dport 44707 @th,64,128 0x{tok} update @knock4 {{ ip saddr timeout 60s }} drop"));
+        let k6 = at(&format!("meta nfproto ipv6 udp dport 44707 @th,64,128 0x{tok} update @knock6 {{ ip6 saddr timeout 60s }} drop"));
+        let s4 = at("tcp dport 22 ip saddr @knock4 accept");
+        let s6 = at("tcp dport 22 ip6 saddr @knock6 accept");
+        // 敲门规则须在公开 UDP 端口放行之前，否则派生端口撞上公开端口时敲门包被提前 accept。
+        let pub_udp = at("udp dport @public_udp accept");
+        assert!(k4 < pub_udp && k6 < pub_udp);
+        assert!(s4 < pub_udp && s6 < pub_udp);
+        // 不再有无条件的 SSH 放行；名单 saddr 规则仍在。
+        assert!(!s.contains("tcp dport 22 accept"));
+        assert!(s.contains("ip saddr @allow4 accept"));
+        // 不回应：没有对错误口令的 reject / 显式 drop 规则，错口令包照常落到 policy drop。
+        assert_eq!(s.matches("udp dport 44707").count(), 2);
+    }
+
+    #[test]
+    fn ssh_allowlist_only_without_knock_params_has_no_knock_rules() {
+        // 内核不认敲门时的降级形态：仅名单，无敲门（与 0.2.10 行为一致）。
+        let s = render_apply(&RulesetConfig { ssh_allowlist_only: true, ..RulesetConfig::default() }, &[], Utc::now());
+        assert!(!s.contains("knock"));
+        assert!(!s.contains("tcp dport 22 accept"));
     }
 
     fn gated() -> RulesetConfig {

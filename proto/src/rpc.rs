@@ -125,6 +125,12 @@ pub struct AgentSettings {
     /// 门是否实际生效：开关开但内核/nft 不认门链表达式时为 false（已退回无门 ruleset）。`None` 同上。
     #[serde(default)]
     pub forward_gate_active: Option<bool>,
+    /// SSH 敲门 UDP 端口（ADR 0012；云安全组须放行）。`None` = 旧版 agent。
+    #[serde(default)]
+    pub ssh_knock_port: Option<u16>,
+    /// 敲门规则是否实际生效：「仅名单」开着且内核接受敲门规则时为 true。`None` = 旧版 agent。
+    #[serde(default)]
+    pub ssh_knock_active: Option<bool>,
 }
 
 /// 隧道内的 RPC 响应。成功负载按对应 op 的类型编码（客户端据 op 反序列化）；
