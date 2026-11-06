@@ -1,6 +1,6 @@
 # macOS 原生客户端（SwiftUI）实施方案
 
-状态：第 1–6 步完成，功能与 Tauri 桌面版对齐，主窗口外壳已改 AppKit，待用户日常试用
+状态：第 1–7 步完成，功能与 Tauri 桌面版对齐，主窗口外壳已改 AppKit，待用户日常试用
 日期：2026-11-01
 关联：ADR 0009（定案）、0010（外壳改 AppKit）、0007（传输）
 
@@ -40,6 +40,8 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
    - **5e 身份导出 / 二维码**：✅ 文件菜单「导出设备身份…」（无主机时不可用）；口令输两次，生成后显示白底黑码的多帧轮播二维码（0.9 秒一帧，与 Tauri 版同节奏）和文本备份，「拷贝备份」在底栏。macOS 只出码不扫码，扫码导入在手机端。
 6. **主窗口外壳改 AppKit**（ADR 0010）：✅ `NavigationSplitView` + `.inspector` 换成 `NSSplitViewController`（左栏 / 内容 / 右栏）+ `NSToolbar`（按栏分段）；各栏内容仍是现有 SwiftUI 视图。原因：SwiftUI 驱动的右栏展开卡顿，左栏开着时还会把左栏推出窗口。先用验证工程实测开合流畅、不推栏，外观对齐后再迁移。外壳在 `mac/ipgate/MainWindow.swift`：工具栏按钮统一在这里构建，状态用 `withObservationTracking` 从模型同步，页面里不再写 `.toolbar`；「放行」弹出框是锚在工具栏按钮上的 `NSPopover`；侧栏搜索是原生 `NSSearchField`。
 
+7. **主机出口 IP + 公开端口**（ADR 0011，需 agent ≥ 0.2.10）：✅ 右栏「访问与安全」加「主机出口」（IPv4 / IPv6，可选中、右键拷贝；打开右栏时才探测，⌘R 重探）；新增「公开端口」分区（⌘5，追加在末尾不打乱 ⌘1–⌘4）：表格列端口 / 协议 / 备注，config.json 里的标「配置文件」只读；右键编辑备注 / 拷贝 / 删除，双击编辑，Delete 键批量删除，工具栏「+」添加。旧 agent 显示升级提示。
+
 ## 界面设计决策
 
 按使用频率设计：最常见的是「出口 IP 变了进不去 → 放行本机」，其次是清理名单，转发/安全/设备/配对/同步是偶尔操作。
@@ -55,6 +57,10 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
 用户拍板（2026-11-01）：
 - 要：启动时探测全部主机（启动会连所有主机一次）、菜单栏图标、出口 IP 变化时通知。
 - 不要：「放行本机」时顺手撤销旧「本机」条目。
+
+用户拍板（2026-11-05）：
+- 要：主机出口 IP（服务器自己往外连的公网地址，agent 用成熟的公共检测服务探测）；按端口对全部 IP 放行（「公开端口」独立分区，每条带备注）。
+- SSH「仅名单可连」时不许把 SSH 端口加成公开端口，提示去「安全」改。
 
 ## SDK 27 用得上的 API
 
@@ -80,7 +86,8 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
 - **Rust 构建放在聚合 target `RustCore`，不要放 app 的 preBuildScript**：Xcode 在 app target 的脚本阶段之前就把 XCFramework 头文件拷进构建目录，ffi 一改，第一次构建会用旧头文件报找不到符号。
 - **网络切换后先 `reset_connections` 再重探**：旧连接可能要等 30 秒 RPC 超时才发现断了；没断的话主机实测到的仍是旧出口。
 - **视图 body 里会写入的缓存（如每主机页面模型字典）标 `@ObservationIgnored`**：否则在视图更新中改了被观察状态。
-- **工具栏分段控件要 `visibilityPriority = .high` + `controlRepresentation = .expanded`，并设为 `centeredItemIdentifiers`，窗口最小宽 860**：否则窗口一窄，分区切换会被折成下拉或挤进「»」；不固定居中的话右侧按钮随分区增减，它会左右挪。「放行本机」优先级 `.low` 先让位（名单上方横幅里也有）。
+- **工具栏分段控件要 `visibilityPriority = .high`，并设为 `centeredItemIdentifiers`，窗口最小宽 860**：否则窗口一窄，分区切换会被折成下拉或挤进「»」；不固定居中的话右侧按钮随分区增减，它会左右挪。「放行本机」优先级 `.low` 先让位（名单上方横幅里也有）。
+- **分区控件自己建 `NSSegmentedControl` 并按最宽标题定宽，不用 `NSToolbarItemGroup(titles:)`**：后者生成的控件比外层玻璃胶囊宽，最后一段的长标题（「公开端口」）会越出胶囊；收进溢出菜单靠 `menuFormRepresentation` 的子菜单。
 - **自定义 view 的工具栏项也要给 item 设 target / action**：收进溢出菜单时菜单项用的是 item 自己的，只设在按钮上会点不动。
 - **`NSSearchField` 点 × 清空、按 Esc 不发 `controlTextDidChange`**：要同时接 target / action，否则过滤停在旧关键字。
 - **整页加载用 `LoadingView`（0.3 秒后才显示转圈）**：数据通常百毫秒内回来，直接出 `ProgressView` 会一闪而过。
