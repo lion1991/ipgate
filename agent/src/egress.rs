@@ -13,10 +13,11 @@ use tokio::task::JoinSet;
 
 const SOURCES: &[(&str, &str)] = &[("icanhazip.com", "/"), ("api64.ipify.org", "/"), ("ifconfig.me", "/ip")];
 const TIMEOUT: Duration = Duration::from_secs(5);
+const GRACE: Duration = Duration::from_secs(1);
 const MAX_RESPONSE: usize = 4096;
 
 pub async fn probe() -> EgressIp {
-    let (v4, v6) = tokio::join!(probe_family(false), probe_family(true));
+    let (v4, v6) = race_families(probe_family(false), probe_family(true), GRACE).await;
     EgressIp {
         ipv4: v4.and_then(|ip| match ip {
             IpAddr::V4(a) => Some(a),
@@ -26,6 +27,28 @@ pub async fn probe() -> EgressIp {
             IpAddr::V6(a) => Some(a),
             IpAddr::V4(_) => None,
         }),
+    }
+}
+
+/// 一族先探到后另一族最多再等 `grace`：v6 黑洞路由（有地址但不通）时不必等满 [`TIMEOUT`]。
+/// 先结束的一族没探到，则照常等另一族。
+async fn race_families<A, B>(a: A, b: B, grace: Duration) -> (Option<IpAddr>, Option<IpAddr>)
+where
+    A: Future<Output = Option<IpAddr>>,
+    B: Future<Output = Option<IpAddr>>,
+{
+    tokio::pin!(a, b);
+    tokio::select! {
+        r = &mut a => { let other = late(r.is_some(), b, grace).await; (r, other) }
+        r = &mut b => { let other = late(r.is_some(), a, grace).await; (other, r) }
+    }
+}
+
+async fn late(hit: bool, f: impl Future<Output = Option<IpAddr>>, grace: Duration) -> Option<IpAddr> {
+    if hit {
+        tokio::time::timeout(grace, f).await.ok().flatten()
+    } else {
+        f.await
     }
 }
 
@@ -109,6 +132,21 @@ mod tests {
         let futs: Vec<std::pin::Pin<Box<dyn Future<Output = Option<IpAddr>> + Send>>> =
             vec![Box::pin(async { None }), Box::pin(slow_ok)];
         assert_eq!(first_some(futs.into_iter()).await, Some("203.0.113.9".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn slow_family_gets_grace_only_after_a_hit() {
+        let ip = |s: &str| -> Option<IpAddr> { Some(s.parse().unwrap()) };
+        let hang = || async { tokio::time::sleep(Duration::from_secs(30)).await; ip("2001:db8::1") };
+        let start = std::time::Instant::now();
+        let r = race_families(async { ip("203.0.113.1") }, hang(), Duration::from_millis(100)).await;
+        assert_eq!(r, (ip("203.0.113.1"), None));
+        assert!(start.elapsed() < Duration::from_secs(2));
+
+        // 先结束的一族没探到：另一族照常等，不被宽限截断。
+        let slow_v4 = async { tokio::time::sleep(Duration::from_millis(300)).await; ip("203.0.113.2") };
+        let r = race_families(slow_v4, async { None }, Duration::from_millis(100)).await;
+        assert_eq!(r, (ip("203.0.113.2"), None));
     }
 
     /// 真网络探测，手动跑：`cargo test -p ipgate-agent egress::tests::live -- --ignored --nocapture`
