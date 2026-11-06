@@ -61,6 +61,8 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
 用户拍板（2026-11-05）：
 - 要：主机出口 IP（服务器自己往外连的公网地址，agent 用成熟的公共检测服务探测）；按端口对全部 IP 放行（「公开端口」独立分区，每条带备注）。
 - SSH「仅名单可连」时不许把 SSH 端口加成公开端口，提示去「安全」改。
+- 默认窗口 1037×693、侧栏 220、右栏 240（即用户当时的布局），居中的分区控件刚好不越过右栏分隔线。
+- 不要：工具栏按栏分段（`NSTrackingSeparatorToolbarItem` 把右栏开关隔到右栏上方）。NSToolbar 不把分隔线当硬边界，中间栏放不下标题 + 分区控件 + 放行本机 / + / 刷新时照样越线，反而更难看。
 
 ## SDK 27 用得上的 API
 
@@ -86,7 +88,7 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
 - **Rust 构建放在聚合 target `RustCore`，不要放 app 的 preBuildScript**：Xcode 在 app target 的脚本阶段之前就把 XCFramework 头文件拷进构建目录，ffi 一改，第一次构建会用旧头文件报找不到符号。
 - **网络切换后先 `reset_connections` 再重探**：旧连接可能要等 30 秒 RPC 超时才发现断了；没断的话主机实测到的仍是旧出口。
 - **视图 body 里会写入的缓存（如每主机页面模型字典）标 `@ObservationIgnored`**：否则在视图更新中改了被观察状态。
-- **工具栏分段控件要 `visibilityPriority = .high`，并设为 `centeredItemIdentifiers`，窗口最小宽 860**：否则窗口一窄，分区切换会被折成下拉或挤进「»」；不固定居中的话右侧按钮随分区增减，它会左右挪。「放行本机」优先级 `.low` 先让位（名单上方横幅里也有）。
+- **工具栏分段控件要 `visibilityPriority = .high`，并设为 `centeredItemIdentifiers`，窗口最小宽 860；默认栏宽一改，分区控件可能越过右栏分隔线，改前截图核对**：否则窗口一窄，分区切换会被折成下拉或挤进「»」；不固定居中的话右侧按钮随分区增减，它会左右挪。「放行本机」优先级 `.low` 先让位（名单上方横幅里也有）。
 - **分区控件自己建 `NSSegmentedControl`（`segmentDistribution = .fit`，每段按标题自适应），不用 `NSToolbarItemGroup(titles:)`**：后者生成的控件等宽且比外层玻璃胶囊宽，最后一段的长标题（「公开端口」）会越出胶囊；按最长标题等宽也不行，整条过宽会贴到右侧按钮。收进溢出菜单靠 `menuFormRepresentation` 的子菜单。
 - **自定义 view 的工具栏项也要给 item 设 target / action**：收进溢出菜单时菜单项用的是 item 自己的，只设在按钮上会点不动。
 - **`NSSearchField` 点 × 清空、按 Esc 不发 `controlTextDidChange`**：要同时接 target / action，否则过滤停在旧关键字。
