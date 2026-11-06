@@ -87,7 +87,7 @@ core 的数据目录和 Keychain service 由调用方传入：Tauri 版继续用
 - **网络切换后先 `reset_connections` 再重探**：旧连接可能要等 30 秒 RPC 超时才发现断了；没断的话主机实测到的仍是旧出口。
 - **视图 body 里会写入的缓存（如每主机页面模型字典）标 `@ObservationIgnored`**：否则在视图更新中改了被观察状态。
 - **工具栏分段控件要 `visibilityPriority = .high`，并设为 `centeredItemIdentifiers`，窗口最小宽 860**：否则窗口一窄，分区切换会被折成下拉或挤进「»」；不固定居中的话右侧按钮随分区增减，它会左右挪。「放行本机」优先级 `.low` 先让位（名单上方横幅里也有）。
-- **分区控件自己建 `NSSegmentedControl` 并按最宽标题定宽，不用 `NSToolbarItemGroup(titles:)`**：后者生成的控件比外层玻璃胶囊宽，最后一段的长标题（「公开端口」）会越出胶囊；收进溢出菜单靠 `menuFormRepresentation` 的子菜单。
+- **分区控件自己建 `NSSegmentedControl`（`segmentDistribution = .fit`，每段按标题自适应），不用 `NSToolbarItemGroup(titles:)`**：后者生成的控件等宽且比外层玻璃胶囊宽，最后一段的长标题（「公开端口」）会越出胶囊；按最长标题等宽也不行，整条过宽会贴到右侧按钮。收进溢出菜单靠 `menuFormRepresentation` 的子菜单。
 - **自定义 view 的工具栏项也要给 item 设 target / action**：收进溢出菜单时菜单项用的是 item 自己的，只设在按钮上会点不动。
 - **`NSSearchField` 点 × 清空、按 Esc 不发 `controlTextDidChange`**：要同时接 target / action，否则过滤停在旧关键字。
 - **整页加载用 `LoadingView`（0.3 秒后才显示转圈）**：数据通常百毫秒内回来，直接出 `ProgressView` 会一闪而过。
