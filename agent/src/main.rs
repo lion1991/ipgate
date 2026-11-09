@@ -683,7 +683,14 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
     let live = Arc::new(nft::Live::default());
     {
         let mut s = store.lock_safe();
-        if !s.prune_expired(Utc::now()).is_empty() {
+        let now = Utc::now();
+        let mut dirty = !s.prune_expired(now).is_empty();
+        if s.open_all_expired(now) {
+            s.set_open_all(None);
+            dirty = true;
+            info!("放行所有 IP 已到期，按关闭重建");
+        }
+        if dirty {
             s.save()?;
         }
         live.record(&nft::apply_ruleset(&*backend, &cfg.ruleset_with(s.ruleset_flags()), s.entries())?);
@@ -742,6 +749,32 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
     rt.block_on(api::serve(state, identity, psk, addr))
 }
 
+/// 「放行所有 IP」到期则整表重建关掉（ADR 0013）。先落内核再落盘：失败时保持开着，下轮重试。
+/// 调用方持 store 锁，与 RPC 开关的「apply + 落盘」串行。
+pub(crate) fn close_expired_open_all(
+    cfg: &AgentConfig,
+    s: &mut Store,
+    backend: &dyn NftBackend,
+    live: &nft::Live,
+    now: chrono::DateTime<Utc>,
+) {
+    if !s.open_all_expired(now) {
+        return;
+    }
+    let flags = store::RulesetFlags { open_all: false, ..s.ruleset_flags() };
+    match nft::apply_ruleset(backend, &cfg.ruleset_with(flags), s.entries()) {
+        Ok(applied) => {
+            live.record(&applied);
+            s.set_open_all(None);
+            if let Err(e) = s.save() {
+                warn!(error = %e, "放行所有 IP 已关闭，但落盘失败");
+            }
+            info!("放行所有 IP 已到期关闭");
+        }
+        Err(e) => warn!(error = %e, "放行所有 IP 到期关闭失败，下轮重试"),
+    }
+}
+
 fn reconcile_loop(
     cfg: Arc<AgentConfig>,
     store: Arc<Mutex<Store>>,
@@ -757,6 +790,7 @@ fn reconcile_loop(
             if !s.prune_expired(now).is_empty() {
                 let _ = s.save();
             }
+            close_expired_open_all(&cfg, &mut s, &*backend, &live, now);
             s.entries().to_vec()
         };
         match backend.list() {
@@ -889,6 +923,10 @@ fn status(cfg: &AgentConfig) -> Result<()> {
         if flags.ssh_allowlist_only { "仅名单" } else { "对所有人开放" },
         if flags.forward_allowlist_only { "开（转发仅名单/公开端口）" } else { "关（转发对所有人开放）" },
     );
+    if let Some(o) = store.open_all() {
+        let until = o.until.map(|t| t.to_rfc3339()).unwrap_or_else(|| "永久".to_owned());
+        println!("放行所有 IP：开（SSH 除外），到期={until}");
+    }
     if let Some(k) = &cfg.ssh_knock {
         println!("SSH 敲门端口：UDP {}（仅名单时生效；云安全组须放行）", k.port);
     }

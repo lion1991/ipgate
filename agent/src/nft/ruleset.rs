@@ -182,9 +182,15 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
     s.push_str(&format!("        udp dport @{NFT_SET_PUBLIC_UDP} accept\n"));
     s.push_str(&format!("        ip saddr @{NFT_SET_ALLOW4} accept\n"));
     s.push_str(&format!("        ip6 saddr @{NFT_SET_ALLOW6} accept\n"));
+    if cfg.open_all {
+        // 放行所有 IP（ADR 0013）：排在名单之后，名单内源照常命中上面的规则（含 SSH）。
+        // SSH 不放，仍按上面的「仅名单」/ 全网开放。
+        s.push_str("        meta l4proto != tcp accept\n");
+        s.push_str(&format!("        tcp dport != {} accept\n", cfg.ssh_port));
+    }
     s.push_str("    }\n");
     if cfg.forward_allowlist_only {
-        s.push_str(&render_forward_gate());
+        s.push_str(&render_forward_gate(cfg.open_all));
     }
     s.push_str("}\n");
     s
@@ -197,7 +203,7 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
 /// policy accept：未被 DNAT 的转发（容器出网、VPN 路由）不受影响。drop 终局，故其它表
 /// （Docker、`ip ipgate_nat`、dnat_utils）forward 链里的 accept 救不回被门丢弃的包；
 /// priority -10 让门先于它们（filter 0）求值。
-fn render_forward_gate() -> String {
+fn render_forward_gate(open_all: bool) -> String {
     let dnat_new = "ct state new ct status dnat";
     let mut s = String::from("    chain forward {\n");
     s.push_str("        type filter hook forward priority -10; policy accept;\n");
@@ -210,6 +216,9 @@ fn render_forward_gate() -> String {
     s.push_str(&format!(
         "        {dnat_new} meta l4proto udp ct original proto-dst @{NFT_SET_PUBLIC_UDP} accept\n"
     ));
+    if open_all {
+        s.push_str(&format!("        {dnat_new} accept\n"));
+    }
     s.push_str(&format!("        {dnat_new} counter drop\n"));
     s.push_str("    }\n");
     s
@@ -455,5 +464,41 @@ mod tests {
             assert_eq!(a[..input_end], b[..input_end]);
             assert!(b.ends_with("    }\n}\n"));
         }
+    }
+
+    #[test]
+    fn open_all_off_renders_nothing_extra() {
+        let s = render_apply(&gated(), &[], Utc::now());
+        assert!(!s.contains("!="));
+        assert_eq!(s.matches("ct status dnat accept").count(), 0);
+    }
+
+    #[test]
+    fn open_all_appends_after_allowlist_and_keeps_ssh() {
+        // ADR 0013：除 SSH 外全放；SSH 仍按「仅名单」（名单 / 敲门），排在名单规则之后。
+        for ssh_allowlist_only in [false, true] {
+            let off = RulesetConfig { ssh_allowlist_only, ssh_port: 2222, ..gated() };
+            let on = RulesetConfig { open_all: true, ..off.clone() };
+            let a = render_apply(&off, &[], Utc::now());
+            let b = render_apply(&on, &[], Utc::now());
+            let tail = "        ip6 saddr @allow6 accept\n";
+            let (i, j) = (a.find(tail).unwrap() + tail.len(), b.find(tail).unwrap() + tail.len());
+            assert_eq!(a[..i], b[..j], "开关之前的 input 链逐字节不变");
+            assert!(b[j..].starts_with(
+                "        meta l4proto != tcp accept\n        tcp dport != 2222 accept\n    }\n"
+            ));
+            assert_eq!(b.contains("tcp dport 2222 accept"), !ssh_allowlist_only);
+        }
+    }
+
+    #[test]
+    fn open_all_lets_dnat_through_gate() {
+        let s = render_apply(&RulesetConfig { open_all: true, ..gated() }, &[], Utc::now());
+        let gate = &s[s.find("    chain forward {").unwrap()..];
+        let lines: Vec<&str> = gate.lines().map(str::trim).collect();
+        assert_eq!(
+            lines[7..9],
+            ["ct state new ct status dnat accept", "ct state new ct status dnat counter drop"]
+        );
     }
 }

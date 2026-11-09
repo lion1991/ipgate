@@ -337,6 +337,10 @@ fn dispatch(st: &AppState, device: DeviceId, peer_ip: IpAddr, req: RpcRequest) -
         }
         // 要发网络请求，由连接循环异步处理，不进这里。
         EgressIp => Err(ApiError::new(ErrorCode::Internal, "EgressIp 须经连接循环处理")),
+        SetOpenAll { enabled, duration_secs } => {
+            tracing::warn!(%device, enabled, ?duration_secs, "特权操作：设置放行所有 IP");
+            to_val(handlers::set_open_all(st, enabled, duration_secs)?)
+        }
         ListPublicPorts => to_val(handlers::list_public_ports(st)),
         AddPublicPort(r) => {
             tracing::warn!(%device, proto = ?r.proto, start = r.ports.start, end = r.ports.end, "特权操作：新增公开端口");

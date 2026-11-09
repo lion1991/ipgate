@@ -125,6 +125,7 @@ impl AgentConfig {
             ssh_allowlist_only: flags.ssh_allowlist_only,
             ssh_knock: self.ssh_knock.clone(),
             forward_allowlist_only: flags.forward_allowlist_only,
+            open_all: flags.open_all,
             public_tcp,
             public_udp,
         }

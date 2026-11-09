@@ -1,6 +1,6 @@
 # ADR 0013：放行所有 IP（SSH 除外）
 
-状态：已定案（待实施，进度见 `docs/plans/open-all.md`）
+状态：已定案（agent 0.2.12 已实现、待发布；客户端进度见 `docs/plans/open-all.md`）
 日期：2026-11-09
 关联：ADR 0002（ruleset 布局、过期由 agent 权威）、0008（转发名单门）、0011（公开端口、SSH 暴露只在「安全」里管）、0012（敲门）
 
@@ -25,6 +25,14 @@
 | 8 | 客户端只做 Mac 原生，移动端（Tauri）不动（用户拍板：Mac 上不用 Tauri，移动平台不动） | |
 | 9 | Mac：开关放「安全」分区，确认框里选时长；开着时名单页顶部常驻横幅（剩余时间 + 「关闭」），右栏「访问与安全」同步显示 | 全开是高风险状态，必须一直看得见、一键能关 |
 
+## RPC 与存储
+
+- `set_open_all { enabled, duration_secs? }` → `AgentSettings`。`duration_secs` 省略 = 永久，须在 1 秒到 24 小时（`OPEN_ALL_MAX_SECS`）之间；到期时间由 agent 按自己的时钟算，不受两端时钟差影响。
+- `AgentSettings` 新增 `open_all: Option<bool>`、`open_all_expires_in_secs: Option<u64>`（agent 算好剩余秒数再报，客户端从收到时倒数）。旧 agent 两者为 `None`，旧 agent 收到 `set_open_all` 回「请求解析失败」，客户端据此提示升级（agent ≥ 0.2.12）。
+- `state.json` 的 `open_all: { until? }`，关着时不写出该字段，与旧版落盘一致。
+- 名单添加 `0.0.0.0/0`、`::/0` 回 `BadRequest`：「不能把所有地址加入名单（SSH 会随之对全网开放）。要对所有 IP 开放，请用「安全」里的「放行所有 IP」」。
+- `ipgate-agent status` 打印开关状态与到期时间。
+
 ## 已否决
 
 - **往名单加 `0.0.0.0/0`、`::/0`**：绕过 SSH「仅名单」；与已有条目重叠可能让整表事务被拒。
@@ -40,6 +48,7 @@
 ## 验证
 
 - 2026-11-09 OrbStack 容器（内核 7.2）：agent 实际渲染的 ruleset（仅名单 + 敲门 + 转发门）加上决策 3 的规则。trixie（nft 1.1.3）netns 拓扑实测：未放行源 SSH 不通，其他 TCP、UDP、ping、DNAT 转发都通；源在名单里时 SSH 也通；敲门入 `knock4` 后 SSH 通。bookworm（nft 1.0.6）`nft -c` 通过。
+- 同日用 agent 0.2.12 `print-ruleset` 实际渲染的 ruleset 复测，与上面手写版逐字节一致，流量结果相同。
 - 未验证：el7（nft 0.8）、真机内核、IPv6 流量。
 
 ## 顺带发现：名单重叠条目让整表落地失败（现存 bug）

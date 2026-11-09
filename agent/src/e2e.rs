@@ -791,6 +791,92 @@ async fn revoke_covered_legacy_entry() {
     let _ = std::fs::remove_dir_all(&srv.data_dir);
 }
 
+fn applied_open_all(srv: &Server) -> bool {
+    srv.backend.applied_cfg.lock().unwrap().as_ref().unwrap().open_all
+}
+
+#[tokio::test]
+async fn open_all_toggle_flow() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("mac".into()) },
+    )
+    .await
+    .unwrap();
+    let set = |enabled: bool, duration_secs: Option<u64>| RpcRequest::SetOpenAll { enabled, duration_secs };
+
+    let s: AgentSettings = cli.ok(RpcRequest::GetSettings).await;
+    assert_eq!((s.open_all, s.open_all_expires_in_secs), (Some(false), None));
+
+    let s: AgentSettings = cli.ok(set(true, Some(3600))).await;
+    assert_eq!(s.open_all, Some(true));
+    assert!(matches!(s.open_all_expires_in_secs, Some(3598..=3600)));
+    assert!(applied_open_all(&srv));
+
+    let s: AgentSettings = cli.ok(set(true, None)).await;
+    assert_eq!((s.open_all, s.open_all_expires_in_secs), (Some(true), None), "永久");
+
+    // 时长越界：拒绝且不碰内核。
+    let before = srv.backend.applied_cfg.lock().unwrap().clone();
+    for bad in [0, OPEN_ALL_MAX_SECS + 1] {
+        expect_code(&mut cli, set(true, Some(bad)), ErrorCode::BadRequest).await;
+    }
+    assert_eq!(*srv.backend.applied_cfg.lock().unwrap(), before);
+
+    // 落内核失败：不改设置。
+    srv.backend.fail_apply.store(true, Ordering::SeqCst);
+    expect_nft_failure(&mut cli, set(false, None)).await;
+    let s: AgentSettings = cli.ok(RpcRequest::GetSettings).await;
+    assert_eq!(s.open_all, Some(true));
+    srv.backend.fail_apply.store(false, Ordering::SeqCst);
+
+    let s: AgentSettings = cli.ok(set(false, None)).await;
+    assert_eq!((s.open_all, s.open_all_expires_in_secs), (Some(false), None));
+    assert!(!applied_open_all(&srv));
+
+    // 名单不接受所有地址。
+    let msg = expect_code(
+        &mut cli,
+        RpcRequest::Allow(AllowRequest { target: "0.0.0.0/0".parse().unwrap(), note: String::new(), expires_at: None }),
+        ErrorCode::BadRequest,
+    )
+    .await;
+    assert!(msg.contains("放行所有 IP"), "{msg}");
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+#[test]
+fn open_all_expiry_closes_via_full_apply() {
+    let dir = std::env::temp_dir().join(format!("ipgate-e2e-{}", to_hex(&random_bytes::<8>())));
+    let cfg = AgentConfig { data_dir: dir.clone(), ..AgentConfig::default() };
+    let mut store = Store::load(&cfg.store_path()).unwrap();
+    let backend = MockNft::default();
+    let live = crate::nft::Live::default();
+    let now = Utc::now();
+    store.set_open_all(Some(crate::store::OpenAll { until: Some(now + chrono::Duration::seconds(5)) }));
+
+    crate::close_expired_open_all(&cfg, &mut store, &backend, &live, now);
+    assert!(store.open_all().is_some(), "未到期不动");
+    assert!(backend.applied_cfg.lock().unwrap().is_none());
+
+    let later = now + chrono::Duration::seconds(5);
+    backend.fail_apply.store(true, Ordering::SeqCst);
+    crate::close_expired_open_all(&cfg, &mut store, &backend, &live, later);
+    assert!(store.open_all().is_some(), "落内核失败时保持开着，下轮重试");
+
+    backend.fail_apply.store(false, Ordering::SeqCst);
+    crate::close_expired_open_all(&cfg, &mut store, &backend, &live, later);
+    assert!(store.open_all().is_none());
+    assert!(!backend.applied_cfg.lock().unwrap().as_ref().unwrap().open_all);
+    assert!(Store::load(&cfg.store_path()).unwrap().open_all().is_none(), "已落盘");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn public_ports_flow() {
     let srv = spawn().await;

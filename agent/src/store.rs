@@ -58,6 +58,17 @@ pub struct State {
     /// 客户端添加的公开端口（与 config.json 里的合并落地）。
     #[serde(default)]
     pub public_ports: Vec<PublicPort>,
+    /// 「放行所有 IP」（ADR 0013）；`None` = 关。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_all: Option<OpenAll>,
+}
+
+/// 「放行所有 IP」开着时的状态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAll {
+    /// 到期时间；`None` = 永久。到期由对账循环关闭。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
 }
 
 /// ruleset 的运行期设置（存 store），由 [`crate::config::AgentConfig::ruleset_with`] 注入渲染。
@@ -66,18 +77,21 @@ pub struct RulesetFlags {
     pub ssh_allowlist_only: bool,
     pub forward_allowlist_only: bool,
     pub public_ports: Vec<PublicPort>,
+    pub open_all: bool,
 }
 
-/// 放行目标与已有条目互相包含（见 [`Store::allow`]）。`Display` 即给用户看的提示。
+/// 放行被拒的原因（见 [`Store::allow`]）。`Display` 即给用户看的提示。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Overlap {
+pub enum AllowError {
+    /// `0.0.0.0/0`、`::/0`：会绕过 SSH「仅名单」，改用「放行所有 IP」（ADR 0013）。
+    AllAddresses,
     /// 已被这条覆盖。
     CoveredBy(IpNet),
     /// 会覆盖这些已有条目。
     Covers(Vec<IpNet>),
 }
 
-impl std::fmt::Display for Overlap {
+impl std::fmt::Display for AllowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // 单地址不带 /32、/128，与客户端名单的显示一致。
         let show = |t: &IpNet| {
@@ -88,6 +102,9 @@ impl std::fmt::Display for Overlap {
             }
         };
         match self {
+            Self::AllAddresses => {
+                f.write_str("不能把所有地址加入名单（SSH 会随之对全网开放）。要对所有 IP 开放，请用「安全」里的「放行所有 IP」")
+            }
             Self::CoveredBy(t) => write!(f, "已被 {} 覆盖，无需重复放行", show(t)),
             Self::Covers(ts) => {
                 let list = ts.iter().map(show).collect::<Vec<_>>().join("、");
@@ -182,7 +199,10 @@ impl Store {
         req: AllowRequest,
         by: DeviceId,
         now: DateTime<Utc>,
-    ) -> Result<Entry, Overlap> {
+    ) -> Result<Entry, AllowError> {
+        if req.target.prefix_len() == 0 {
+            return Err(AllowError::AllAddresses);
+        }
         let net = req.target.trunc();
         let others = || {
             self.state
@@ -192,11 +212,11 @@ impl Store {
                 .map(|e| e.target)
         };
         if let Some(outer) = others().find(|t| t.trunc().contains(&net)) {
-            return Err(Overlap::CoveredBy(outer));
+            return Err(AllowError::CoveredBy(outer));
         }
         let inner: Vec<IpNet> = others().filter(|t| net.contains(&t.trunc())).collect();
         if !inner.is_empty() {
-            return Err(Overlap::Covers(inner));
+            return Err(AllowError::Covers(inner));
         }
         self.state.entries.retain(|e| e.target != req.target);
         let entry = Entry {
@@ -228,6 +248,7 @@ impl Store {
             ssh_allowlist_only: self.state.ssh_allowlist_only,
             forward_allowlist_only: self.state.forward_allowlist_only,
             public_ports: self.state.public_ports.clone(),
+            open_all: self.state.open_all.is_some(),
         }
     }
 
@@ -237,6 +258,19 @@ impl Store {
 
     pub fn set_public_ports(&mut self, ports: Vec<PublicPort>) {
         self.state.public_ports = ports;
+    }
+
+    pub fn open_all(&self) -> Option<&OpenAll> {
+        self.state.open_all.as_ref()
+    }
+
+    pub fn set_open_all(&mut self, v: Option<OpenAll>) {
+        self.state.open_all = v;
+    }
+
+    /// 「放行所有 IP」开着且已到期（该由 agent 关掉）。
+    pub fn open_all_expired(&self, now: DateTime<Utc>) -> bool {
+        matches!(&self.state.open_all, Some(OpenAll { until: Some(t) }) if *t <= now)
     }
 
     /// 设置转发名单门；返回是否发生了变化。
@@ -437,7 +471,7 @@ mod tests {
 
         let e = s.allow(req("198.51.100.0/24"), by, now).unwrap_err();
         assert_eq!(e.to_string(), "会覆盖已有的 198.51.100.7，请先撤销它");
-        let e = s.allow(req("0.0.0.0/0"), by, now).unwrap_err();
+        let e = s.allow(req("192.0.0.0/2"), by, now).unwrap_err();
         assert_eq!(
             e.to_string(),
             "会覆盖已有的 203.0.113.0/24、198.51.100.7，请先撤销它们"
@@ -449,6 +483,34 @@ mod tests {
         s.allow(req("203.0.113.0/24"), by, now).unwrap();
         s.allow(req("2001:db8::/32"), by, now).unwrap();
         assert_eq!(s.entries().len(), 3);
+    }
+
+    #[test]
+    fn allow_rejects_all_addresses() {
+        let mut s = temp_store();
+        for t in ["0.0.0.0/0", "::/0"] {
+            assert_eq!(s.allow(req(t), DeviceId::new(), Utc::now()), Err(AllowError::AllAddresses));
+        }
+        assert!(s.entries().is_empty());
+    }
+
+    #[test]
+    fn open_all_state_compat_and_expiry() {
+        let now = Utc::now();
+        // 旧 state.json 没有该字段 → 关；关着时不写出该字段（落盘与旧版一致）。
+        let st: State = serde_json::from_str(r#"{"entries":[],"devices":[],"revision":0}"#).unwrap();
+        assert!(st.open_all.is_none());
+        assert!(!serde_json::to_string(&st).unwrap().contains("open_all"));
+
+        let mut s = temp_store();
+        s.set_open_all(Some(OpenAll { until: None }));
+        assert!(s.ruleset_flags().open_all);
+        assert!(!s.open_all_expired(now), "永久不过期");
+        s.set_open_all(Some(OpenAll { until: Some(now + chrono::Duration::minutes(1)) }));
+        assert!(!s.open_all_expired(now));
+        assert!(s.open_all_expired(now + chrono::Duration::minutes(1)));
+        s.set_open_all(None);
+        assert!(!s.ruleset_flags().open_all);
     }
 
     #[test]

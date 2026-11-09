@@ -8,12 +8,12 @@ use super::error::{internal, ApiResult};
 use super::AppState;
 use crate::nft::{Applied, Gate};
 use crate::reconcile;
-use crate::store::{LockExt, RulesetFlags};
+use crate::store::{AllowError, LockExt, OpenAll, RulesetFlags};
 use chrono::Utc;
 use ipgate_proto::{
     validate_ports, AddForwardRequest, AgentSettings, AllowRequest, Allowlist, ApiError, Device,
     DeviceId, Diff, Entry, ErrorCode, ForwardCaps, ForwardId, ForwardOrigin, ForwardRule,
-    ForwardProto, ForwardView, InterfaceInfo, PortRange, PublicPort, PublicPortRequest,
+    ForwardProto, ForwardView, InterfaceInfo, PortRange, PublicPort, PublicPortRequest, OPEN_ALL_MAX_SECS,
     RevokeRequest, UnifiedForwardList, UnifiedForwardView, WhoamiResponse,
 };
 use std::net::IpAddr;
@@ -36,7 +36,13 @@ pub fn allow(st: &AppState, by: DeviceId, req: AllowRequest) -> ApiResult<Entry>
         let mut store = st.store.lock_safe();
         let entry = store
             .allow(req, by, now)
-            .map_err(|o| ApiError::new(ErrorCode::Conflict, o.to_string()))?;
+            .map_err(|e| {
+                let code = match e {
+                    AllowError::AllAddresses => ErrorCode::BadRequest,
+                    _ => ErrorCode::Conflict,
+                };
+                ApiError::new(code, e.to_string())
+            })?;
         store.save().map_err(internal)?;
         entry
     };
@@ -95,7 +101,11 @@ pub fn sync(st: &AppState) -> ApiResult<Diff> {
 /// 组装 [`AgentSettings`]：运行期开关 + 静态端口 + best-effort 的 sshd 认证态势。
 /// `sshd -T` 探测失败（无 root/无 sshd）时各认证项为 `None`，不影响其余字段。
 fn build_settings(st: &AppState) -> AgentSettings {
-    let flags = st.store.lock_safe().ruleset_flags();
+    let (flags, open_all) = {
+        let store = st.store.lock_safe();
+        (store.ruleset_flags(), store.open_all().cloned())
+    };
+    let now = Utc::now();
     let auth = crate::sshd::probe();
     AgentSettings {
         ssh_allowlist_only: flags.ssh_allowlist_only,
@@ -107,6 +117,10 @@ fn build_settings(st: &AppState) -> AgentSettings {
         forward_gate_active: Some(st.live.gate.load(Ordering::SeqCst)),
         ssh_knock_port: st.cfg.ssh_knock.as_ref().map(|k| k.port),
         ssh_knock_active: Some(st.live.knock.load(Ordering::SeqCst)),
+        open_all: Some(open_all.is_some()),
+        open_all_expires_in_secs: open_all
+            .and_then(|o| o.until)
+            .map(|t| (t - now).num_seconds().max(0) as u64),
     }
 }
 
@@ -272,6 +286,36 @@ pub fn set_forward_exposure(st: &AppState, allowlist_only: bool) -> ApiResult<Ag
             ));
         }
         store.set_forward_allowlist_only(allowlist_only);
+        store.save().map_err(internal)?;
+    }
+    Ok(build_settings(st))
+}
+
+/// 开 / 关「放行所有 IP」（ADR 0013）：先落内核再落盘，失败不改设置。
+pub fn set_open_all(
+    st: &AppState,
+    enabled: bool,
+    duration_secs: Option<u64>,
+) -> ApiResult<AgentSettings> {
+    let open = if enabled {
+        if let Some(secs) = duration_secs {
+            if secs == 0 || secs > OPEN_ALL_MAX_SECS {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    "时长须在 1 秒到 24 小时之间；更长请选永久",
+                ));
+            }
+        }
+        let now = Utc::now();
+        Some(OpenAll { until: duration_secs.map(|s| now + chrono::Duration::seconds(s as i64)) })
+    } else {
+        None
+    };
+    {
+        let mut store = st.store.lock_safe();
+        let flags = RulesetFlags { open_all: open.is_some(), ..store.ruleset_flags() };
+        reapply_ruleset(st, flags, store.entries())?;
+        store.set_open_all(open);
         store.save().map_err(internal)?;
     }
     Ok(build_settings(st))

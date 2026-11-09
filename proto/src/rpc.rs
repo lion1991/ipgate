@@ -99,7 +99,17 @@ pub enum RpcRequest {
     AddPublicPort(PublicPortRequest),
     /// 移除客户端添加的公开端口（config.json 里的删不掉），返回最新列表。
     RemovePublicPort { proto: ForwardProto, ports: PortRange },
+    /// 开 / 关「放行所有 IP」（ADR 0013，SSH 除外）并整表重建，返回 [`AgentSettings`]。
+    /// `duration_secs` 为开启时长，`None` = 永久；由 agent 按自己的时钟算到期，免受两端时钟差影响。
+    SetOpenAll {
+        enabled: bool,
+        #[serde(default)]
+        duration_secs: Option<u64>,
+    },
 }
+
+/// 「放行所有 IP」单次开启的最长时长（秒）；更长的用永久。
+pub const OPEN_ALL_MAX_SECS: u64 = 24 * 3600;
 
 /// agent 可由客户端查看/调节的运行期设置（ADR 0007）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +141,12 @@ pub struct AgentSettings {
     /// 敲门规则是否实际生效：「仅名单」开着且内核接受敲门规则时为 true。`None` = 旧版 agent。
     #[serde(default)]
     pub ssh_knock_active: Option<bool>,
+    /// 「放行所有 IP」是否开着（ADR 0013）。`None` = 旧版 agent 不支持。
+    #[serde(default)]
+    pub open_all: Option<bool>,
+    /// 开着时距自动关闭还有多少秒；`None` = 永久或未开。按 agent 时钟算好再报，客户端从收到时倒数。
+    #[serde(default)]
+    pub open_all_expires_in_secs: Option<u64>,
 }
 
 /// 隧道内的 RPC 响应。成功负载按对应 op 的类型编码（客户端据 op 反序列化）；

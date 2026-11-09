@@ -25,6 +25,10 @@ pub struct RulesetConfig {
     /// 是否也仅放行名单内源 IP 与公开端口。默认 false = 不接管 forward hook，转发对全网开放。
     #[serde(default)]
     pub forward_allowlist_only: bool,
+    /// 放行所有 IP（ADR 0013）：视同所有源 IP 都在名单里，SSH 除外（仍按 `ssh_allowlist_only`）。
+    /// 到期由 agent 关闭，内核规则本身不过期。
+    #[serde(default)]
+    pub open_all: bool,
     /// 对全世界开放的 TCP 端口/区间（默认空）。
     #[serde(default)]
     pub public_tcp: Vec<PortRange>,
@@ -40,6 +44,7 @@ impl Default for RulesetConfig {
             ssh_allowlist_only: false,
             ssh_knock: None,
             forward_allowlist_only: false,
+            open_all: false,
             public_tcp: Vec::new(),
             public_udp: Vec::new(),
         }
