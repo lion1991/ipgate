@@ -248,7 +248,8 @@ impl Store {
             ssh_allowlist_only: self.state.ssh_allowlist_only,
             forward_allowlist_only: self.state.forward_allowlist_only,
             public_ports: self.state.public_ports.clone(),
-            open_all: self.state.open_all.is_some(),
+            // 已到期按关算：服务停着时的救援 CLI、到期后对账关掉之前的其它整表重建，都不能把它落回内核。
+            open_all: self.state.open_all.is_some() && !self.open_all_expired(Utc::now()),
         }
     }
 
@@ -509,6 +510,10 @@ mod tests {
         s.set_open_all(Some(OpenAll { until: Some(now + chrono::Duration::minutes(1)) }));
         assert!(!s.open_all_expired(now));
         assert!(s.open_all_expired(now + chrono::Duration::minutes(1)));
+        assert!(s.ruleset_flags().open_all);
+        // 已到期、还没被对账关掉：渲染一律按关（回归：服务停着时救援 CLI 曾把过期开关重新落进内核）。
+        s.set_open_all(Some(OpenAll { until: Some(now - chrono::Duration::seconds(1)) }));
+        assert!(!s.ruleset_flags().open_all);
         s.set_open_all(None);
         assert!(!s.ruleset_flags().open_all);
     }

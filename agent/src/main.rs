@@ -925,7 +925,11 @@ fn status(cfg: &AgentConfig) -> Result<()> {
     );
     if let Some(o) = store.open_all() {
         let until = o.until.map(|t| t.to_rfc3339()).unwrap_or_else(|| "永久".to_owned());
-        println!("放行所有 IP：开（SSH 除外），到期={until}");
+        if flags.open_all {
+            println!("放行所有 IP：开（SSH 除外），到期={until}");
+        } else {
+            println!("放行所有 IP：已于 {until} 到期，下次整表重建按关闭落地（服务运行时 30 秒内）");
+        }
     }
     if let Some(k) = &cfg.ssh_knock {
         println!("SSH 敲门端口：UDP {}（仅名单时生效；云安全组须放行）", k.port);
