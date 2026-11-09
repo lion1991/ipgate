@@ -172,6 +172,26 @@ mod tests {
     }
 
     #[test]
+    fn set_open_all_wire_format() {
+        let r = RpcRequest::SetOpenAll { enabled: true, duration_secs: Some(3600) };
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"op":"set_open_all","body":{"enabled":true,"duration_secs":3600}}"#
+        );
+        // 省略时长 = 永久。
+        let back: RpcRequest =
+            serde_json::from_str(r#"{"op":"set_open_all","body":{"enabled":true}}"#).unwrap();
+        assert_eq!(back, RpcRequest::SetOpenAll { enabled: true, duration_secs: None });
+    }
+
+    #[test]
+    fn agent_settings_from_old_agent_has_no_open_all() {
+        let s: AgentSettings =
+            serde_json::from_str(r#"{"ssh_allowlist_only":false,"ssh_port":22}"#).unwrap();
+        assert_eq!((s.open_all, s.open_all_expires_in_secs), (None, None));
+    }
+
+    #[test]
     fn rpc_request_unit_variant_is_bare_op() {
         assert_eq!(serde_json::to_string(&RpcRequest::Sync).unwrap(), r#"{"op":"sync"}"#);
     }
