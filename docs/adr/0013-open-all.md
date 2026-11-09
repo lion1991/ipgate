@@ -1,6 +1,6 @@
 # ADR 0013：放行所有 IP（SSH 除外）
 
-状态：已定案（agent 0.2.12 已实现、待发布；客户端进度见 `docs/plans/open-all.md`）
+状态：已定案（agent 0.2.12 与 Mac 客户端已实现、待发布；进度见 `docs/plans/open-all.md`）
 日期：2026-11-09
 关联：ADR 0002（ruleset 布局、过期由 agent 权威）、0008（转发名单门）、0011（公开端口、SSH 暴露只在「安全」里管）、0012（敲门）
 
