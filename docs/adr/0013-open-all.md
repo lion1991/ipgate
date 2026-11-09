@@ -30,7 +30,7 @@
 - `set_open_all { enabled, duration_secs? }` → `AgentSettings`。`duration_secs` 省略 = 永久，须在 1 秒到 24 小时（`OPEN_ALL_MAX_SECS`）之间；到期时间由 agent 按自己的时钟算，不受两端时钟差影响。
 - `AgentSettings` 新增 `open_all: Option<bool>`、`open_all_expires_in_secs: Option<u64>`（agent 算好剩余秒数再报，客户端从收到时倒数）。旧 agent 两者为 `None`，旧 agent 收到 `set_open_all` 回「请求解析失败」，客户端据此提示升级（agent ≥ 0.2.12）。
 - `state.json` 的 `open_all: { until? }`，关着时不写出该字段，与旧版落盘一致。
-- 名单添加 `0.0.0.0/0`、`::/0` 回 `BadRequest`：「不能把所有地址加入名单（SSH 会随之对全网开放）。要对所有 IP 开放，请用「安全」里的「放行所有 IP」」。
+- 名单添加 `0.0.0.0/0`、`::/0` 回 `BadRequest`：「不能把所有地址加入名单（SSH 会随之对全网开放）。要对所有 IP 开放，请在 Mac 客户端的「安全」里打开「放行所有 IP」」。
 - `ipgate-agent status` 打印开关状态与到期时间。
 
 ## 已否决

@@ -103,7 +103,7 @@ impl std::fmt::Display for AllowError {
         };
         match self {
             Self::AllAddresses => {
-                f.write_str("不能把所有地址加入名单（SSH 会随之对全网开放）。要对所有 IP 开放，请用「安全」里的「放行所有 IP」")
+                f.write_str("不能把所有地址加入名单（SSH 会随之对全网开放）。要对所有 IP 开放，请在 Mac 客户端的「安全」里打开「放行所有 IP」")
             }
             Self::CoveredBy(t) => write!(f, "已被 {} 覆盖，无需重复放行", show(t)),
             Self::Covers(ts) => {
