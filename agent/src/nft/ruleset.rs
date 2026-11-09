@@ -94,10 +94,7 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
     // 先算出各 set 的元素，内联进 set 定义（见 set_def 说明）。
     let mut v4 = Vec::new();
     let mut v6 = Vec::new();
-    for e in entries {
-        if e.is_expired(now) {
-            continue;
-        }
+    for e in crate::reconcile::effective(entries, now) {
         let tok = element_token(&e.target, e.expires_at, now);
         match e.target {
             IpNet::V4(_) => v4.push(tok),
@@ -298,6 +295,15 @@ mod tests {
         assert!(s.contains("set allow4 { type ipv4_addr; flags interval, timeout; elements = { 203.0.113.0/24 } }"));
         assert!(s.contains("set allow6 { type ipv6_addr; flags interval, timeout; elements = { 2001:db8::/32 } }"));
         assert!(!s.contains("198.51.100.9"));
+    }
+
+    #[test]
+    fn overlapping_entries_render_outermost_only() {
+        // 回归：内联重叠元素会让 nft -f 报 conflicting intervals，整表落地失败、agent 起不来。
+        let now = Utc::now();
+        let entries = vec![entry("203.0.113.5/32", None), entry("203.0.113.0/24", None)];
+        let s = render_apply(&RulesetConfig::default(), &entries, now);
+        assert!(s.contains("set allow4 { type ipv4_addr; flags interval, timeout; elements = { 203.0.113.0/24 } }"));
     }
 
     #[test]

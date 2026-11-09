@@ -68,6 +68,36 @@ pub struct RulesetFlags {
     pub public_ports: Vec<PublicPort>,
 }
 
+/// 放行目标与已有条目互相包含（见 [`Store::allow`]）。`Display` 即给用户看的提示。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Overlap {
+    /// 已被这条覆盖。
+    CoveredBy(IpNet),
+    /// 会覆盖这些已有条目。
+    Covers(Vec<IpNet>),
+}
+
+impl std::fmt::Display for Overlap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 单地址不带 /32、/128，与客户端名单的显示一致。
+        let show = |t: &IpNet| {
+            if t.prefix_len() == t.max_prefix_len() {
+                t.addr().to_string()
+            } else {
+                t.to_string()
+            }
+        };
+        match self {
+            Self::CoveredBy(t) => write!(f, "已被 {} 覆盖，无需重复放行", show(t)),
+            Self::Covers(ts) => {
+                let list = ts.iter().map(show).collect::<Vec<_>>().join("、");
+                let it = if ts.len() > 1 { "它们" } else { "它" };
+                write!(f, "会覆盖已有的 {list}，请先撤销{it}")
+            }
+        }
+    }
+}
+
 pub struct Store {
     path: PathBuf,
     state: State,
@@ -145,7 +175,29 @@ impl Store {
     }
 
     /// 新增放行；若该目标已存在则覆盖其元数据。返回最终条目。
-    pub fn allow(&mut self, req: AllowRequest, by: DeviceId, now: DateTime<Utc>) -> Entry {
+    ///
+    /// 与其它有效条目互相包含时拒绝：interval set 不接受重叠元素，增量添加与整表落地都会被 nft 拒。
+    pub fn allow(
+        &mut self,
+        req: AllowRequest,
+        by: DeviceId,
+        now: DateTime<Utc>,
+    ) -> Result<Entry, Overlap> {
+        let net = req.target.trunc();
+        let others = || {
+            self.state
+                .entries
+                .iter()
+                .filter(|e| e.target != req.target && !e.is_expired(now))
+                .map(|e| e.target)
+        };
+        if let Some(outer) = others().find(|t| t.trunc().contains(&net)) {
+            return Err(Overlap::CoveredBy(outer));
+        }
+        let inner: Vec<IpNet> = others().filter(|t| net.contains(&t.trunc())).collect();
+        if !inner.is_empty() {
+            return Err(Overlap::Covers(inner));
+        }
         self.state.entries.retain(|e| e.target != req.target);
         let entry = Entry {
             id: EntryId::new(),
@@ -157,7 +209,7 @@ impl Store {
         };
         self.state.entries.push(entry.clone());
         self.state.revision += 1;
-        entry
+        Ok(entry)
     }
 
     // ---- SSH 端口暴露模式（ADR 0007）----
@@ -343,8 +395,8 @@ mod tests {
         let mut s = temp_store();
         let by = DeviceId::new();
         let now = Utc::now();
-        s.allow(req("203.0.113.0/24"), by, now);
-        s.allow(req("198.51.100.7/32"), by, now);
+        s.allow(req("203.0.113.0/24"), by, now).unwrap();
+        s.allow(req("198.51.100.7/32"), by, now).unwrap();
         assert_eq!(s.entries().len(), 2);
         assert_eq!(s.revision(), 2);
 
@@ -361,12 +413,53 @@ mod tests {
         let mut s = temp_store();
         let by = DeviceId::new();
         let now = Utc::now();
-        s.allow(req("203.0.113.5/32"), by, now);
+        s.allow(req("203.0.113.5/32"), by, now).unwrap();
         let mut r = req("203.0.113.5/32");
         r.note = "更新".into();
-        s.allow(r, by, now);
+        s.allow(r, by, now).unwrap();
         assert_eq!(s.entries().len(), 1);
         assert_eq!(s.entries()[0].note, "更新");
+    }
+
+    #[test]
+    fn allow_rejects_overlap() {
+        // 回归：互相包含的条目会让 nft 拒绝增量添加与整表落地（ADR 0013「顺带发现」）。
+        let mut s = temp_store();
+        let by = DeviceId::new();
+        let now = Utc::now();
+        s.allow(req("203.0.113.0/24"), by, now).unwrap();
+        s.allow(req("198.51.100.7/32"), by, now).unwrap();
+
+        let e = s.allow(req("203.0.113.5/32"), by, now).unwrap_err();
+        assert_eq!(e.to_string(), "已被 203.0.113.0/24 覆盖，无需重复放行");
+        // 网段相同、写法不同也算覆盖。
+        assert!(s.allow(req("203.0.113.9/24"), by, now).is_err());
+
+        let e = s.allow(req("198.51.100.0/24"), by, now).unwrap_err();
+        assert_eq!(e.to_string(), "会覆盖已有的 198.51.100.7，请先撤销它");
+        let e = s.allow(req("0.0.0.0/0"), by, now).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "会覆盖已有的 203.0.113.0/24、198.51.100.7，请先撤销它们"
+        );
+        assert_eq!(s.entries().len(), 2, "被拒时不改存储");
+        assert_eq!(s.revision(), 2);
+
+        // 同目标照旧是覆盖更新；不同地址族互不影响。
+        s.allow(req("203.0.113.0/24"), by, now).unwrap();
+        s.allow(req("2001:db8::/32"), by, now).unwrap();
+        assert_eq!(s.entries().len(), 3);
+    }
+
+    #[test]
+    fn allow_ignores_expired_overlap() {
+        let mut s = temp_store();
+        let by = DeviceId::new();
+        let now = Utc::now();
+        let mut old = req("203.0.113.0/24");
+        old.expires_at = Some(now - chrono::Duration::minutes(1));
+        s.allow(old, by, now - chrono::Duration::hours(1)).unwrap();
+        s.allow(req("203.0.113.5/32"), by, now).unwrap();
     }
 
     #[test]
@@ -376,8 +469,8 @@ mod tests {
         let now = Utc::now();
         let mut expiring = req("192.0.2.1/32");
         expiring.expires_at = Some(now - chrono::Duration::minutes(1));
-        s.allow(expiring, by, now);
-        s.allow(req("192.0.2.2/32"), by, now);
+        s.allow(expiring, by, now).unwrap();
+        s.allow(req("192.0.2.2/32"), by, now).unwrap();
 
         let removed = s.prune_expired(now);
         assert_eq!(removed, vec!["192.0.2.1/32".parse::<IpNet>().unwrap()]);
@@ -459,7 +552,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!("ipgate-test-{}.json", EntryId::new()));
         {
             let mut s = Store::load(&p).unwrap();
-            s.allow(req("203.0.113.0/24"), DeviceId::new(), Utc::now());
+            s.allow(req("203.0.113.0/24"), DeviceId::new(), Utc::now()).unwrap();
             s.save().unwrap();
         }
         let reloaded = Store::load(&p).unwrap();

@@ -50,7 +50,10 @@ impl NftBackend for MockNft {
         Ok(())
     }
     fn remove(&self, target: &IpNet) -> anyhow::Result<()> {
-        self.set.lock().unwrap().retain(|t| t != target);
+        let mut set = self.set.lock().unwrap();
+        // 与真实 nft 一致：delete element 删不存在的元素会报错。
+        anyhow::ensure!(set.contains(target), "Error: element does not exist");
+        set.retain(|t| t != target);
         Ok(())
     }
     fn list(&self) -> anyhow::Result<Vec<KernelElement>> {
@@ -723,6 +726,69 @@ async fn expect_code(cli: &mut Client, req: RpcRequest, code: ErrorCode) -> Stri
         }
         RpcResponse::Ok(v) => panic!("应失败，实际成功：{v}"),
     }
+}
+
+#[tokio::test]
+async fn allow_overlap_rejected() {
+    let srv = spawn().await;
+    let (priv_, _pub) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("mac".into()) },
+    )
+    .await
+    .unwrap();
+    let allow = |t: &str| {
+        RpcRequest::Allow(AllowRequest { target: t.parse().unwrap(), note: String::new(), expires_at: None })
+    };
+    let _: Entry = cli.ok(allow("203.0.113.0/24")).await;
+
+    let msg = expect_code(&mut cli, allow("203.0.113.7/32"), ErrorCode::Conflict).await;
+    assert_eq!(msg, "已被 203.0.113.0/24 覆盖，无需重复放行");
+    let msg = expect_code(&mut cli, allow("203.0.0.0/16"), ErrorCode::Conflict).await;
+    assert_eq!(msg, "会覆盖已有的 203.0.113.0/24，请先撤销它");
+
+    let list: Allowlist = cli.ok(RpcRequest::ListAllowlist).await;
+    assert_eq!(list.entries.len(), 1, "被拒时不落盘");
+    assert_eq!(srv.backend.set.lock().unwrap().len(), 1, "被拒时不碰内核");
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+#[tokio::test]
+async fn revoke_covered_legacy_entry() {
+    // 旧版本存下的重叠条目：内层被外层覆盖、没落内核，撤销它不能报 nft 失败。
+    let e = |t: &str| {
+        format!(
+            r#"{{"id":"{}","target":"{t}","created_at":"2026-11-01T00:00:00Z","created_by":"{}"}}"#,
+            EntryId::new(),
+            DeviceId::new()
+        )
+    };
+    let state = format!(
+        r#"{{"entries":[{},{}],"devices":[],"revision":2}}"#,
+        e("203.0.113.0/24"),
+        e("203.0.113.7/32")
+    );
+    let srv = spawn_with(AgentConfig::default(), Some(&state)).await;
+    srv.backend.set.lock().unwrap().push("203.0.113.0/24".parse().unwrap());
+    let (priv_, _pub) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("mac".into()) },
+    )
+    .await
+    .unwrap();
+
+    let _: serde_json::Value =
+        cli.ok(RpcRequest::Revoke(RevokeRequest::Target("203.0.113.7/32".parse().unwrap()))).await;
+    let list: Allowlist = cli.ok(RpcRequest::ListAllowlist).await;
+    assert_eq!(list.entries.len(), 1);
+    assert_eq!(*srv.backend.set.lock().unwrap(), vec!["203.0.113.0/24".parse::<IpNet>().unwrap()]);
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
 }
 
 #[tokio::test]

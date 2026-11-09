@@ -34,7 +34,9 @@ pub fn allow(st: &AppState, by: DeviceId, req: AllowRequest) -> ApiResult<Entry>
     // 存储为期望态权威：先持久化，再落内核（落内核失败也会被对账循环补上）。
     let entry = {
         let mut store = st.store.lock_safe();
-        let entry = store.allow(req, by, now);
+        let entry = store
+            .allow(req, by, now)
+            .map_err(|o| ApiError::new(ErrorCode::Conflict, o.to_string()))?;
         store.save().map_err(internal)?;
         entry
     };
@@ -45,7 +47,7 @@ pub fn allow(st: &AppState, by: DeviceId, req: AllowRequest) -> ApiResult<Entry>
 }
 
 pub fn revoke(st: &AppState, req: RevokeRequest) -> ApiResult<()> {
-    let target = {
+    let (target, in_kernel) = {
         let mut store = st.store.lock_safe();
         let target = match req {
             RevokeRequest::Target(t) => t,
@@ -54,15 +56,21 @@ pub fn revoke(st: &AppState, req: RevokeRequest) -> ApiResult<()> {
                 .map(|e| e.target)
                 .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "条目不存在"))?,
         };
+        // 被外层条目覆盖的（旧版本存下的重叠）本就没落内核，delete element 会报不存在。
+        let in_kernel = reconcile::effective(store.entries(), Utc::now())
+            .iter()
+            .any(|e| e.target == target);
         if !store.revoke_by_target(&target) {
             return Err(ApiError::new(ErrorCode::NotFound, "条目不存在"));
         }
         store.save().map_err(internal)?;
-        target
+        (target, in_kernel)
     };
-    st.backend
-        .remove(&target)
-        .map_err(|e| ApiError::new(ErrorCode::NftFailure, e.to_string()))?;
+    if in_kernel {
+        st.backend
+            .remove(&target)
+            .map_err(|e| ApiError::new(ErrorCode::NftFailure, e.to_string()))?;
+    }
     Ok(())
 }
 

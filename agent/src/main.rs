@@ -349,7 +349,8 @@ fn allow_cli(cfg: &AgentConfig, target: &str, note: &str, ttl_secs: Option<u64>)
         },
         DeviceId(Uuid::nil()),
         now,
-    );
+    )
+    .map_err(|o| anyhow::anyhow!("{o}"))?;
     store.save()?;
     let _ = NftCli::new().add(&entry);
     println!("已放行 {net}");
@@ -768,13 +769,14 @@ fn reconcile_loop(
                         "对账：修正内核差异"
                     );
                 }
+                // 先删后补：外层条目过期后，它还在内核时补被包含的会因重叠被拒。
+                for target in &d.stale_in_kernel {
+                    let _ = backend.remove(target);
+                }
                 for target in &d.missing_in_kernel {
                     if let Some(entry) = entries.iter().find(|e| &e.target == target) {
                         let _ = backend.add(entry);
                     }
-                }
-                for target in &d.stale_in_kernel {
-                    let _ = backend.remove(target);
                 }
             }
             Err(e) => {
