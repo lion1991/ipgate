@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use ipgate_proto::{
     AddForwardRequest, AllowRequest, Device, DeviceId, Entry, EntryId, ForwardId, ForwardRule,
-    NoisePublicKey, PublicPort,
+    ForwardSwitch, NoisePublicKey, PublicPort,
 };
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,14 @@ impl<T> LockExt<T> for Mutex<T> {
     }
 }
 
+/// 一条多目标规则的选择结果（持久化，重启后流量不跳回目标 0）。
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailoverState {
+    pub selected: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_switch: Option<ForwardSwitch>,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct State {
     pub entries: Vec<Entry>,
@@ -47,6 +55,10 @@ pub struct State {
     /// 上次成功解析的转发目标 IP（域名解析失败时回退用，对齐动态域名诉求）。
     #[serde(default)]
     pub resolved: HashMap<ForwardId, Ipv4Addr>,
+    /// 多目标规则当前选中的目标与上次切换（ADR 0014）。没有条目即选中目标 0；
+    /// `resolved` 存的始终是选中目标的 IP。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub failover: HashMap<ForwardId, FailoverState>,
     /// SSH 端口是否仅对放行名单开放（ADR 0007）。默认 false=对所有人开放（防自锁）；
     /// 客户端可经 `SetSshExposure` 切换。运行期可调，故存这里而非静态 config.json。
     #[serde(default)]
@@ -312,9 +324,6 @@ impl Store {
         by: DeviceId,
         now: DateTime<Utc>,
     ) -> ForwardRule {
-        self.state
-            .forwards
-            .retain(|f| !(f.iface == req.iface && f.listen == req.listen));
         let rule = ForwardRule {
             id: ForwardId::new(),
             proto: req.proto,
@@ -326,16 +335,42 @@ impl Store {
             note: req.note,
             created_at: now,
             created_by: by,
+            extra_targets: req.extra_targets,
+            probe_port: req.probe_port,
         };
+        let replaced: Vec<ForwardId> = self
+            .state
+            .forwards
+            .iter()
+            .filter(|f| f.iface == rule.iface && f.listen == rule.listen)
+            .map(|f| f.id)
+            .collect();
+        for id in replaced {
+            self.state.resolved.remove(&id);
+            self.state.failover.remove(&id);
+        }
+        self.state
+            .forwards
+            .retain(|f| !(f.iface == rule.iface && f.listen == rule.listen));
         self.state.forwards.push(rule.clone());
         self.state.forward_revision += 1;
         rule
     }
 
-    /// 原地修改规则，保留 id 与创建信息。目标变了就丢掉旧解析缓存——否则新域名解析失败时会回退到旧目标 IP。
+    /// 原地修改规则，保留 id 与创建信息。选中目标变了就丢掉旧解析缓存——否则新域名解析失败时
+    /// 会回退到旧目标 IP。目标列表变了选择重置为目标 0（下标已对不上）。
     pub fn update_forward(&mut self, id: ForwardId, req: AddForwardRequest) -> Option<ForwardRule> {
         let rule = self.state.forwards.iter_mut().find(|f| f.id == id)?;
-        if rule.dest_host != req.dest_host {
+        let old_targets: Vec<_> = (0..rule.target_count()).filter_map(|i| rule.target(i)).collect();
+        let new_targets = req.targets();
+        let old_sel = self.state.failover.get(&id).map_or(0, |f| f.selected);
+        let new_sel = if old_targets == new_targets {
+            old_sel
+        } else {
+            self.state.failover.remove(&id);
+            0
+        };
+        if old_targets.get(old_sel).map(|t| &t.host) != new_targets.get(new_sel).map(|t| &t.host) {
             self.state.resolved.remove(&id);
         }
         rule.proto = req.proto;
@@ -345,6 +380,8 @@ impl Store {
         rule.dest_port = req.dest_port;
         rule.source = req.source;
         rule.note = req.note;
+        rule.extra_targets = req.extra_targets;
+        rule.probe_port = req.probe_port;
         let out = rule.clone();
         self.state.forward_revision += 1;
         Some(out)
@@ -356,6 +393,7 @@ impl Store {
         let removed = self.state.forwards.len() != before;
         if removed {
             self.state.resolved.remove(&id);
+            self.state.failover.remove(&id);
             self.state.forward_revision += 1;
         }
         removed
@@ -364,6 +402,23 @@ impl Store {
     /// 上次成功解析到的目标 IP（域名解析失败时的回退源）。
     pub fn resolved_ip(&self, id: ForwardId) -> Option<Ipv4Addr> {
         self.state.resolved.get(&id).copied()
+    }
+
+    /// 多目标规则当前选中的目标下标与上次切换；越界（规则被改短）按 0。
+    pub fn failover(&self, id: ForwardId) -> FailoverState {
+        let n = self.find_forward(id).map_or(1, |f| f.target_count());
+        match self.state.failover.get(&id) {
+            Some(f) if f.selected < n => f.clone(),
+            _ => FailoverState::default(),
+        }
+    }
+
+    /// 记录一次自动切换。选中目标变了，旧的解析缓存就不再是它的 IP，一并丢掉。
+    pub fn set_selected(&mut self, id: ForwardId, sw: ForwardSwitch) {
+        self.state.resolved.remove(&id);
+        self.state
+            .failover
+            .insert(id, FailoverState { selected: sw.to, last_switch: Some(sw) });
     }
 
     /// 整体替换解析缓存（调用方已把「解析失败时沿用旧值」合并进 map）。
@@ -554,7 +609,62 @@ mod tests {
             dest_port: PortRange::single(listen),
             source: ForwardSource::Auto,
             note: String::new(),
+            extra_targets: Vec::new(),
+            probe_port: None,
         }
+    }
+
+    #[test]
+    fn failover_selection_persists_and_resets_on_target_change() {
+        use ipgate_proto::{ForwardSwitch, ForwardTarget, PortRange, SwitchReason};
+        let mut s = temp_store();
+        let mut req = fwd_req(80, "a.com", None);
+        req.extra_targets.push(ForwardTarget { host: "b.com".into(), port: PortRange::single(80) });
+        let r = s.add_forward(req.clone(), DeviceId::new(), Utc::now());
+        assert_eq!(s.failover(r.id).selected, 0);
+
+        s.set_resolved([(r.id, "10.0.0.1".parse().unwrap())].into());
+        let sw = ForwardSwitch { at: Utc::now(), from: 0, to: 1, reason: SwitchReason::Down };
+        s.set_selected(r.id, sw);
+        assert_eq!(s.failover(r.id).selected, 1);
+        // 解析缓存属于旧选中目标，切换后丢掉
+        assert_eq!(s.resolved_ip(r.id), None);
+
+        // 只改备注：选择保留
+        let mut same = req.clone();
+        same.note = "x".into();
+        s.update_forward(r.id, same).unwrap();
+        assert_eq!(s.failover(r.id).selected, 1);
+
+        // 目标列表变了：重置到 0
+        let mut changed = req.clone();
+        changed.extra_targets[0].host = "c.com".into();
+        s.update_forward(r.id, changed).unwrap();
+        assert_eq!(s.failover(r.id).selected, 0);
+        assert!(s.failover(r.id).last_switch.is_none());
+    }
+
+    #[test]
+    fn retargeting_drops_cache_of_previously_selected_target() {
+        use ipgate_proto::{ForwardSwitch, ForwardTarget, PortRange, SwitchReason};
+        let mut s = temp_store();
+        let mut req = fwd_req(80, "a.com", None);
+        req.extra_targets.push(ForwardTarget { host: "b.com".into(), port: PortRange::single(80) });
+        let r = s.add_forward(req.clone(), DeviceId::new(), Utc::now());
+        s.set_selected(r.id, ForwardSwitch { at: Utc::now(), from: 0, to: 1, reason: SwitchReason::Down });
+        // 缓存里是选中目标 b.com 的 IP
+        s.set_resolved([(r.id, "10.0.0.2".parse().unwrap())].into());
+
+        // 改回单目标 a.com：选择回到 0，b.com 的 IP 不能留作 a.com 的回退
+        s.update_forward(r.id, fwd_req(80, "a.com", None)).unwrap();
+        assert_eq!(s.failover(r.id).selected, 0);
+        assert_eq!(s.resolved_ip(r.id), None);
+        assert!(s.state.failover.is_empty());
+
+        // 选中目标 0 时只追加目标：a.com 的缓存保留
+        s.set_resolved([(r.id, "10.0.0.1".parse().unwrap())].into());
+        s.update_forward(r.id, req).unwrap();
+        assert_eq!(s.resolved_ip(r.id), Some("10.0.0.1".parse().unwrap()));
     }
 
     #[test]

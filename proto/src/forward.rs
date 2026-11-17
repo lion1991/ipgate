@@ -64,6 +64,73 @@ pub struct ForwardRule {
     pub note: String,
     pub created_at: DateTime<Utc>,
     pub created_by: DeviceId,
+    /// 额外目标（ADR 0014）：与 `dest_host:dest_port` 不分主次，agent 按探测延迟选一个。
+    /// 为空即单目标规则，行为与 0.2.12 一致、不探测。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_targets: Vec<ForwardTarget>,
+    /// TCP 探测端口；缺省用各目标端口段的第一个端口。纯 UDP 多目标规则必填。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_port: Option<u16>,
+}
+
+/// 一个转发目标（host 可为域名）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ForwardTarget {
+    pub host: String,
+    pub port: PortRange,
+}
+
+/// 一条规则最多几个目标（含 `dest_host`），限住每轮探测量。
+pub const MAX_FORWARD_TARGETS: usize = 8;
+
+/// 第 `i` 个目标：0 为 `dest_host:dest_port`，其后依次为 `extra_targets`。
+fn nth_target(
+    dest_host: &str,
+    dest_port: PortRange,
+    extra: &[ForwardTarget],
+    i: usize,
+) -> Option<ForwardTarget> {
+    if i == 0 {
+        Some(ForwardTarget { host: dest_host.to_string(), port: dest_port })
+    } else {
+        extra.get(i - 1).cloned()
+    }
+}
+
+/// 多目标校验：目标数上限、每个目标的 host 与端口段、不重复、纯 UDP 必须有探测端口。
+fn validate_targets(
+    proto: ForwardProto,
+    listen: &PortRange,
+    dest_host: &str,
+    dest_port: PortRange,
+    extra: &[ForwardTarget],
+    probe_port: Option<u16>,
+) -> Result<(), String> {
+    if probe_port == Some(0) {
+        return Err("探测端口不能为 0".into());
+    }
+    if extra.is_empty() {
+        return Ok(());
+    }
+    if extra.len() + 1 > MAX_FORWARD_TARGETS {
+        return Err(format!("目标最多 {MAX_FORWARD_TARGETS} 个"));
+    }
+    let mut seen = vec![(dest_host.trim().to_ascii_lowercase(), dest_port)];
+    for t in extra {
+        if t.host.trim().is_empty() {
+            return Err("目标主机为空".into());
+        }
+        validate_ports(listen, &t.port)?;
+        let key = (t.host.trim().to_ascii_lowercase(), t.port);
+        if seen.contains(&key) {
+            return Err(format!("目标 {}:{} 重复", t.host.trim(), t.port.start));
+        }
+        seen.push(key);
+    }
+    if proto == ForwardProto::Udp && probe_port.is_none() {
+        return Err("纯 UDP 规则有多个目标时须填 TCP 探测端口".into());
+    }
+    Ok(())
 }
 
 impl ForwardRule {
@@ -79,6 +146,21 @@ impl ForwardRule {
     /// `dest_host` 是否为 IPv4 字面量（否则视作域名，需解析）。
     pub fn dest_is_literal_ip(&self) -> Option<Ipv4Addr> {
         self.dest_host.trim().parse::<Ipv4Addr>().ok()
+    }
+
+    /// 目标总数（含 `dest_host`）。
+    pub fn target_count(&self) -> usize {
+        1 + self.extra_targets.len()
+    }
+
+    /// 第 `i` 个目标：0 为 `dest_host:dest_port`，其后依次为 `extra_targets`。
+    pub fn target(&self, i: usize) -> Option<ForwardTarget> {
+        nth_target(&self.dest_host, self.dest_port, &self.extra_targets, i)
+    }
+
+    /// 探测目标 `t` 用的 TCP 端口。
+    pub fn probe_port_for(&self, t: &ForwardTarget) -> u16 {
+        self.probe_port.unwrap_or(t.port.start)
     }
 }
 
@@ -165,6 +247,79 @@ pub struct AddForwardRequest {
     pub source: ForwardSource,
     #[serde(default)]
     pub note: String,
+    /// 见 [`ForwardRule::extra_targets`]。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_targets: Vec<ForwardTarget>,
+    /// 见 [`ForwardRule::probe_port`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_port: Option<u16>,
+}
+
+impl AddForwardRequest {
+    /// 多目标相关校验（端口段形状、上限、去重、纯 UDP 探测端口）。主目标端口段由调用方另查。
+    pub fn validate_targets(&self) -> Result<(), String> {
+        validate_targets(
+            self.proto,
+            &self.listen,
+            &self.dest_host,
+            self.dest_port,
+            &self.extra_targets,
+            self.probe_port,
+        )
+    }
+
+    /// 全部目标（含 `dest_host`）。
+    pub fn targets(&self) -> Vec<ForwardTarget> {
+        (0..1 + self.extra_targets.len())
+            .filter_map(|i| nth_target(&self.dest_host, self.dest_port, &self.extra_targets, i))
+            .collect()
+    }
+}
+
+/// 目标的探测状态（ADR 0014）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetHealth {
+    /// 还没攒够探测结果（agent 刚启动或规则刚改）。
+    Unknown,
+    Up,
+    /// 连续探测失败，已踢出候选。
+    Down,
+}
+
+/// 多目标规则里一个目标的实时状态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetStatus {
+    pub host: String,
+    pub port: PortRange,
+    /// 最近一次解析到的 IPv4。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<Ipv4Addr>,
+    pub health: TargetHealth,
+    /// 最近几次 TCP 握手耗时的中位数（微秒）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_us: Option<u32>,
+    /// 新连接当前是否转发到它。
+    pub selected: bool,
+}
+
+/// 切换原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchReason {
+    /// 原目标判挂。
+    Down,
+    /// 另一目标持续更快。
+    Latency,
+}
+
+/// 上次自动切换。`from`/`to` 是目标下标（0 = `dest_host`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardSwitch {
+    pub at: DateTime<Utc>,
+    pub from: usize,
+    pub to: usize,
+    pub reason: SwitchReason,
 }
 
 /// 客户端视角的一条转发：规则 + agent 侧解析/落地观测。
@@ -177,6 +332,11 @@ pub struct ForwardView {
     pub resolved_ip: Option<Ipv4Addr>,
     /// 该规则当前是否已在内核生效。
     pub active: bool,
+    /// 多目标规则各目标的状态，顺序同 [`ForwardRule::target`]；单目标规则为空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<TargetStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_switch: Option<ForwardSwitch>,
 }
 
 /// 转发列表快照。
@@ -234,6 +394,15 @@ pub struct UnifiedForwardView {
     /// dnat 规则键（`origin=dnat` 时 `Some`；URL 安全，删除/迁移用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dnat_key: Option<String>,
+    /// 以下同 [`ForwardView`]，只有 native 规则会有（ADR 0014）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_targets: Vec<ForwardTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<TargetStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_switch: Option<ForwardSwitch>,
 }
 
 /// 统一转发列表快照。
@@ -269,7 +438,77 @@ mod tests {
             note: String::new(),
             created_at: Utc::now(),
             created_by: DeviceId::new(),
+            extra_targets: Vec::new(),
+            probe_port: None,
         }
+    }
+
+    fn req(proto: ForwardProto, extra: &[(&str, PortRange)], probe: Option<u16>) -> AddForwardRequest {
+        AddForwardRequest {
+            proto,
+            iface: None,
+            listen: PortRange { start: 8000, end: 8010 },
+            dest_host: "a.com".into(),
+            dest_port: PortRange { start: 9000, end: 9010 },
+            source: ForwardSource::Auto,
+            note: String::new(),
+            extra_targets: extra
+                .iter()
+                .map(|(h, p)| ForwardTarget { host: h.to_string(), port: *p })
+                .collect(),
+            probe_port: probe,
+        }
+    }
+
+    #[test]
+    fn extra_targets_validated() {
+        let same = PortRange { start: 9000, end: 9010 };
+        assert!(req(ForwardProto::Tcp, &[], None).validate_targets().is_ok());
+        assert!(req(ForwardProto::Tcp, &[("b.com", same)], None).validate_targets().is_ok());
+        // 区间→单端口同样允许
+        assert!(req(ForwardProto::Both, &[("b.com", PortRange::single(1))], None)
+            .validate_targets()
+            .is_ok());
+        // 端口段长度对不上
+        assert!(req(ForwardProto::Tcp, &[("b.com", PortRange { start: 1, end: 3 })], None)
+            .validate_targets()
+            .is_err());
+        // 空 host、与主目标重复（大小写/空白不同也算）
+        assert!(req(ForwardProto::Tcp, &[(" ", same)], None).validate_targets().is_err());
+        assert!(req(ForwardProto::Tcp, &[(" A.com", same)], None).validate_targets().is_err());
+        // 纯 UDP 多目标必须有探测端口；单目标不要求
+        assert!(req(ForwardProto::Udp, &[("b.com", same)], None).validate_targets().is_err());
+        assert!(req(ForwardProto::Udp, &[("b.com", same)], Some(22)).validate_targets().is_ok());
+        assert!(req(ForwardProto::Udp, &[], None).validate_targets().is_ok());
+        assert!(req(ForwardProto::Tcp, &[], Some(0)).validate_targets().is_err());
+        // 上限
+        let many: Vec<(String, PortRange)> =
+            (0..MAX_FORWARD_TARGETS).map(|i| (format!("h{i}.com"), same)).collect();
+        let many: Vec<(&str, PortRange)> = many.iter().map(|(h, p)| (h.as_str(), *p)).collect();
+        assert!(req(ForwardProto::Tcp, &many, None).validate_targets().is_err());
+        assert!(req(ForwardProto::Tcp, &many[1..], None).validate_targets().is_ok());
+    }
+
+    #[test]
+    fn targets_index_and_probe_port() {
+        let mut r = rule(PortRange::single(443), PortRange::single(8443), "a.com");
+        r.extra_targets.push(ForwardTarget { host: "b.com".into(), port: PortRange::single(9443) });
+        assert_eq!(r.target_count(), 2);
+        assert_eq!(r.target(0).unwrap().host, "a.com");
+        let b = r.target(1).unwrap();
+        assert_eq!(r.probe_port_for(&b), 9443);
+        assert!(r.target(2).is_none());
+        r.probe_port = Some(22);
+        assert_eq!(r.probe_port_for(&b), 22);
+    }
+
+    #[test]
+    fn single_target_rule_serializes_without_new_fields() {
+        // 单目标规则写出的 JSON 与 0.2.12 一致（降级的旧 agent 读得回）。
+        let r = rule(PortRange::single(443), PortRange::single(8443), "a.com");
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("extra_targets").is_none());
+        assert!(v.get("probe_port").is_none());
     }
 
     #[test]

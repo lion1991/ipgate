@@ -291,6 +291,8 @@ async fn forward_crud_flow() {
         dest_port: PortRange { start: 9000, end: 9005 },
         source: ForwardSource::Auto,
         note: String::new(),
+        extra_targets: Vec::new(),
+        probe_port: None,
     };
     match cli.rpc(RpcRequest::AddForward(bad)).await {
         RpcResponse::Err(e) => assert_eq!(e.code, ErrorCode::BadRequest),
@@ -306,6 +308,8 @@ async fn forward_crud_flow() {
         dest_port: PortRange::single(8443),
         source: ForwardSource::Auto,
         note: "web".into(),
+        extra_targets: Vec::new(),
+        probe_port: None,
     };
     let view: ForwardView = cli.ok(RpcRequest::AddForward(req)).await;
     assert_eq!(view.rule.dest_host, "10.0.0.9");
@@ -352,6 +356,8 @@ async fn forward_update_flow() {
         dest_port: PortRange::single(8443),
         source: ForwardSource::Auto,
         note: note.into(),
+        extra_targets: Vec::new(),
+        probe_port: None,
     };
     let a: ForwardView = cli.ok(RpcRequest::AddForward(req(443, "10.0.0.9", "web"))).await;
     let b: ForwardView = cli.ok(RpcRequest::AddForward(req(80, "10.0.0.9", ""))).await;
@@ -384,6 +390,69 @@ async fn forward_update_flow() {
     }
     let list: UnifiedForwardList = cli.ok(RpcRequest::ListForwards).await;
     assert_eq!(list.revision, 3);
+
+    let _ = std::fs::remove_dir_all(&srv.data_dir);
+}
+
+#[tokio::test]
+async fn forward_multi_target_flow() {
+    let srv = spawn().await;
+    let (priv_, _) = gen_device();
+    let mut cli = connect_with(
+        &srv,
+        &priv_,
+        HandshakeHello { pairing_code: Some(new_code(&srv)), device_name: Some("x".into()) },
+    )
+    .await
+    .unwrap();
+
+    let req = |proto, extra: &[&str], probe| AddForwardRequest {
+        proto,
+        iface: Some("eth0".into()),
+        listen: PortRange::single(443),
+        dest_host: "10.0.0.9".into(),
+        dest_port: PortRange::single(8443),
+        source: ForwardSource::Auto,
+        note: String::new(),
+        extra_targets: extra
+            .iter()
+            .map(|h| ForwardTarget { host: h.to_string(), port: PortRange::single(8443) })
+            .collect(),
+        probe_port: probe,
+    };
+    // 额外目标是禁区字面量、纯 UDP 缺探测端口 → BadRequest
+    for r in [
+        req(ForwardProto::Tcp, &["169.254.169.254"], None),
+        req(ForwardProto::Udp, &["10.0.0.10"], None),
+    ] {
+        match cli.rpc(RpcRequest::AddForward(r)).await {
+            RpcResponse::Err(e) => assert_eq!(e.code, ErrorCode::BadRequest),
+            RpcResponse::Ok(_) => panic!("应 BadRequest"),
+        }
+    }
+
+    let v: ForwardView =
+        cli.ok(RpcRequest::AddForward(req(ForwardProto::Udp, &["10.0.0.10"], Some(22)))).await;
+    assert_eq!(v.rule.extra_targets.len(), 1);
+    assert_eq!(v.rule.probe_port, Some(22));
+    // 还没探测：两个目标都 Unknown，选中目标 0
+    assert_eq!(v.targets.len(), 2);
+    assert!(v.targets.iter().all(|t| t.health == TargetHealth::Unknown));
+    assert!(v.targets[0].selected && !v.targets[1].selected);
+    assert!(v.last_switch.is_none());
+
+    let list: UnifiedForwardList = cli.ok(RpcRequest::ListForwards).await;
+    let row = &list.forwards[0];
+    assert_eq!(row.extra_targets, v.rule.extra_targets);
+    assert_eq!(row.probe_port, Some(22));
+    assert_eq!(row.targets.len(), 2);
+
+    // 改回单目标：状态列表随之消失
+    let one: ForwardView = cli
+        .ok(RpcRequest::UpdateForward { id: v.rule.id, rule: req(ForwardProto::Udp, &[], None) })
+        .await;
+    assert!(one.rule.extra_targets.is_empty());
+    assert!(one.targets.is_empty());
 
     let _ = std::fs::remove_dir_all(&srv.data_dir);
 }

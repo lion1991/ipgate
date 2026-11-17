@@ -4,11 +4,12 @@
 //! 与放行名单的对账循环（`reconcile`）平行、互不干扰：转发是整表全量切换，
 //! 名单是 set 元素增量。
 
+use crate::failover;
 use crate::netinfo;
 use crate::nft::{NatBackend, ResolvedForward};
 use crate::resolve;
 use crate::store::{LockExt, Store};
-use ipgate_proto::{ForwardId, ForwardRule, ForwardSource};
+use ipgate_proto::{ForwardId, ForwardRule, ForwardSource, ForwardTarget};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -19,12 +20,20 @@ use tracing::{info, warn};
 
 type Nat = Arc<dyn NatBackend + Send + Sync>;
 
-/// 把一条规则解析成可渲染的 [`ResolvedForward`]；解析不出则 `Err(原因)`（该条跳过）。
+/// 串行化所有落地（API、周期重解析、探测切换），并记住上次落地内容的 hash。
+/// 不串行的话，先解析的一方可能后提交，把旧选择写回内核。
+static APPLY: Mutex<Option<u64>> = Mutex::new(None);
+
+/// 把一条规则按选中目标 `target` 解析成可渲染的 [`ResolvedForward`]；解析不出则 `Err(原因)`（该条跳过）。
 ///
 /// - 网卡：显式 `iface`，否则默认路由网卡。
-/// - 目标 IP：解析 `dest_host`，失败时回退 `prev`（上次成功 IP，动态域名兜底）。
+/// - 目标 IP：解析 `target.host`，失败时回退 `prev`（上次成功 IP，动态域名兜底）。
 /// - SNAT 源：`auto` 取网卡首个 IPv4；显式 IP 若已不在网卡上则回退当前网卡 IP（IP 漂移自愈）。
-fn resolve_one(rule: &ForwardRule, prev: Option<Ipv4Addr>) -> Result<ResolvedForward, String> {
+fn resolve_one(
+    rule: &ForwardRule,
+    target: &ForwardTarget,
+    prev: Option<Ipv4Addr>,
+) -> Result<ResolvedForward, String> {
     let iface = match &rule.iface {
         Some(i) => {
             // 安全闸：网卡名要被原样插进 `nft -f` 的 `iifname "{}"`，非白名单字符
@@ -39,9 +48,9 @@ fn resolve_one(rule: &ForwardRule, prev: Option<Ipv4Addr>) -> Result<ResolvedFor
             .ok_or_else(|| "无默认路由网卡，且未指定 iface".to_string())?,
     };
 
-    let remote_ip = match resolve::resolve_ipv4(&rule.dest_host) {
+    let remote_ip = match resolve::resolve_ipv4(&target.host) {
         Some(ip) => ip,
-        None => prev.ok_or_else(|| format!("解析 {} 失败且无历史 IP", rule.dest_host))?,
+        None => prev.ok_or_else(|| format!("解析 {} 失败且无历史 IP", target.host))?,
     };
     // 安全闸：拒绝把流量 DNAT 到环回/链路本地等禁区。**每次解析后**都查，故能挡住
     // 域名先解析到良性 IP、之后被 DNS 重绑定到 127.0.0.1:<mgmt>/169.254.169.254 的攻击
@@ -68,7 +77,7 @@ fn resolve_one(rule: &ForwardRule, prev: Option<Ipv4Addr>) -> Result<ResolvedFor
         iface,
         listen: rule.listen,
         remote_ip,
-        dest_port: rule.dest_port,
+        dest_port: target.port,
         source_ip,
     })
 }
@@ -77,21 +86,29 @@ fn resolve_one(rule: &ForwardRule, prev: Option<Ipv4Addr>) -> Result<ResolvedFor
 fn resolve_all(
     store: &Arc<Mutex<Store>>,
 ) -> (Vec<ResolvedForward>, HashMap<ForwardId, Ipv4Addr>, Vec<String>) {
-    let (rules, prev): (Vec<ForwardRule>, HashMap<ForwardId, Ipv4Addr>) = {
+    // (规则, 选中目标下标, 回退 IP)。回退优先用探测线程刚解析到的，再用持久化缓存
+    // （store 保证缓存始终属于选中目标）。
+    let rules: Vec<(ForwardRule, usize, Option<Ipv4Addr>)> = {
         let s = store.lock_safe();
-        let rules = s.forwards().to_vec();
-        let prev = rules
+        s.forwards()
             .iter()
-            .filter_map(|r| s.resolved_ip(r.id).map(|ip| (r.id, ip)))
-            .collect();
-        (rules, prev)
+            .map(|r| {
+                let sel = s.failover(r.id).selected;
+                let prev = failover::last_ip(r, sel).or_else(|| s.resolved_ip(r.id));
+                (r.clone(), sel, prev)
+            })
+            .collect()
     };
 
     let mut resolved = Vec::new();
     let mut new_map = HashMap::new();
     let mut warnings = Vec::new();
-    for rule in &rules {
-        match resolve_one(rule, prev.get(&rule.id).copied()) {
+    for (rule, sel, prev) in &rules {
+        let target = rule.target(*sel).unwrap_or_else(|| ForwardTarget {
+            host: rule.dest_host.clone(),
+            port: rule.dest_port,
+        });
+        match resolve_one(rule, &target, *prev) {
             Ok(rf) => {
                 new_map.insert(rule.id, rf.remote_ip);
                 resolved.push(rf);
@@ -100,7 +117,7 @@ fn resolve_all(
                 "{}:{}→{} 跳过：{e}",
                 rule.iface.clone().unwrap_or_else(|| "auto".into()),
                 rule.listen.start,
-                rule.dest_host
+                target.host
             )),
         }
     }
@@ -133,8 +150,38 @@ fn commit(
 ///
 /// 落地失败返回 `Err` 且**不回写**解析缓存——保留上次良态，避免一次抖动污染回退源。
 pub fn apply_now(store: &Arc<Mutex<Store>>, nat: &Nat) -> anyhow::Result<(usize, Vec<String>)> {
+    let mut last = APPLY.lock_safe();
+    apply_locked(store, nat, &mut last)
+}
+
+/// 在落地锁内先改 store 再落地（探测线程切换用）：改动与落地之间插不进别的落地，
+/// 别人的 `commit` 也就不会把刚丢掉的旧解析缓存写回去。
+pub fn mutate_and_apply<R>(
+    store: &Arc<Mutex<Store>>,
+    nat: &Nat,
+    f: impl FnOnce(&mut Store) -> R,
+) -> (R, anyhow::Result<(usize, Vec<String>)>) {
+    let mut last = APPLY.lock_safe();
+    let r = {
+        let mut s = store.lock_safe();
+        let r = f(&mut s);
+        if let Err(e) = s.save() {
+            warn!(error = %e, "转发：保存失败");
+        }
+        r
+    };
+    (r, apply_locked(store, nat, &mut last))
+}
+
+fn apply_locked(
+    store: &Arc<Mutex<Store>>,
+    nat: &Nat,
+    last: &mut Option<u64>,
+) -> anyhow::Result<(usize, Vec<String>)> {
     let (resolved, new_map, warnings) = resolve_all(store);
+    *last = None;
     commit(store, nat, &resolved, new_map)?;
+    *last = Some(hash_of(&resolved));
     Ok((resolved.len(), warnings))
 }
 
@@ -151,13 +198,13 @@ fn hash_of(resolved: &[ResolvedForward]) -> u64 {
 ///
 /// 用解析结果的 hash 跳过「无变化」的轮次，避免每 tick 都 `nft -f` 刷内核/日志。
 pub fn resolve_loop(store: Arc<Mutex<Store>>, nat: Nat, interval: u64) {
-    let mut last_hash: Option<u64> = None;
     loop {
         std::thread::sleep(Duration::from_secs(interval));
+        let mut last = APPLY.lock_safe();
         let (resolved, new_map, warnings) = resolve_all(&store);
         let h = hash_of(&resolved);
-        if Some(h) == last_hash {
-            continue; // 解析结果未变，跳过
+        if Some(h) == *last {
+            continue; // 与上次落地一致，跳过
         }
         match commit(&store, &nat, &resolved, new_map) {
             Ok(()) => {
@@ -165,9 +212,12 @@ pub fn resolve_loop(store: Arc<Mutex<Store>>, nat: Nat, interval: u64) {
                     warn!("转发：{w}");
                 }
                 info!(applied = resolved.len(), "转发：解析结果变化，已重新落地");
-                last_hash = Some(h);
+                *last = Some(h);
             }
-            Err(e) => warn!(error = %e, "转发：周期落地失败（保留上次状态）"),
+            Err(e) => {
+                *last = None;
+                warn!(error = %e, "转发：周期落地失败（保留上次状态）");
+            }
         }
     }
 }
@@ -189,6 +239,8 @@ mod tests {
             note: String::new(),
             created_at: chrono::Utc::now(),
             created_by: ipgate_proto::DeviceId::new(),
+            extra_targets: Vec::new(),
+            probe_port: None,
         }
     }
 
@@ -198,7 +250,7 @@ mod tests {
     #[test]
     fn resolve_one_rejects_injection_iface() {
         let r = rule(Some("eth0\"\nflush ruleset"), "1.2.3.4");
-        let err = resolve_one(&r, None).unwrap_err();
+        let err = resolve_one(&r, &r.target(0).unwrap(), None).unwrap_err();
         assert!(err.contains("非法网卡名"), "应因网卡名被拒，实际：{err}");
     }
 
@@ -206,15 +258,24 @@ mod tests {
     fn resolve_one_rejects_loopback_target() {
         // 把转发目标设成本机环回（典型攻击：暴露 loopback-only 管理面）。
         let r = rule(Some("eth0"), "127.0.0.1");
-        let err = resolve_one(&r, None).unwrap_err();
+        let err = resolve_one(&r, &r.target(0).unwrap(), None).unwrap_err();
         assert!(err.contains("被拒") && err.contains("环回"), "实际：{err}");
     }
 
     #[test]
     fn resolve_one_rejects_metadata_target() {
         let r = rule(Some("eth0"), "169.254.169.254");
-        let err = resolve_one(&r, None).unwrap_err();
+        let err = resolve_one(&r, &r.target(0).unwrap(), None).unwrap_err();
         assert!(err.contains("被拒") && err.contains("链路本地"), "实际：{err}");
+    }
+
+    #[test]
+    fn resolve_one_checks_the_selected_extra_target() {
+        // 多目标规则选中的额外目标同样过禁区检查，且用它自己的端口。
+        let mut r = rule(Some("eth0"), "1.2.3.4");
+        r.extra_targets.push(ForwardTarget { host: "127.0.0.1".into(), port: PortRange::single(22) });
+        let err = resolve_one(&r, &r.target(1).unwrap(), None).unwrap_err();
+        assert!(err.contains("环回"), "实际：{err}");
     }
 
     // 注：prev 回退路径（域名解析失败时退回上次成功 IP）也走同一个 `remote_ip` 禁区检查，

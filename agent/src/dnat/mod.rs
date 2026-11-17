@@ -158,6 +158,10 @@ impl DnatAdapter {
                 conflict: false,
                 id: None,
                 dnat_key,
+                extra_targets: Vec::new(),
+                probe_port: None,
+                targets: Vec::new(),
+                last_switch: None,
             });
         }
         out
@@ -247,6 +251,8 @@ pub fn dnat_rule_to_add_request(r: &DnatRule) -> AddForwardRequest {
         dest_port: r.dest_port,
         source: r.source,
         note: "迁移自 dnat".into(),
+        extra_targets: Vec::new(),
+        probe_port: None,
     }
 }
 
@@ -273,6 +279,8 @@ mod tests {
             dest_port: PortRange::single(80),
             source: ForwardSource::Auto,
             note: String::new(),
+            extra_targets: Vec::new(),
+            probe_port: None,
         };
         assert!(a.upsert(&req, DeviceId::new()).is_err());
     }

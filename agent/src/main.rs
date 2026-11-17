@@ -6,8 +6,10 @@
 mod api;
 mod auth;
 mod config;
+mod conntrack;
 mod dnat;
 mod egress;
+mod failover;
 mod forward;
 mod netinfo;
 mod nft;
@@ -28,7 +30,8 @@ use chrono::{Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand};
 use config::AgentConfig;
 use ipgate_proto::{
-    AddForwardRequest, AllowRequest, DeviceId, ForwardId, ForwardProto, ForwardSource, PortRange,
+    AddForwardRequest, AllowRequest, DeviceId, ForwardId, ForwardProto, ForwardSource, ForwardTarget,
+    PortRange,
     PAIRING_CODE_TTL_SECS,
 };
 use ipnet::IpNet;
@@ -103,6 +106,12 @@ enum Cmd {
         /// 目标 host:port，如 10.0.0.9:8443 或 ex.com:9000-9010（host 可为域名）。
         #[arg(long)]
         dest: String,
+        /// 额外目标 host[:port]，可重复；缺省端口同 --dest。有额外目标时 agent 按延迟选一个（ADR 0014）。
+        #[arg(long = "alt")]
+        alt: Vec<String>,
+        /// TCP 探测端口；缺省用各目标端口段的第一个。纯 UDP 多目标规则必填。
+        #[arg(long)]
+        probe_port: Option<u16>,
         /// 协议：tcp | udp | both。
         #[arg(long, default_value = "tcp")]
         proto: String,
@@ -221,11 +230,18 @@ fn main() -> Result<()> {
         Cmd::ForwardAdd {
             listen,
             dest,
+            alt,
+            probe_port,
             proto,
             iface,
             source,
             note,
-        } => forward_add_cli(&cfg, &listen, &dest, &proto, iface, &source, &note)?,
+        } => forward_add_cli(
+            &cfg,
+            &listen,
+            &dest,
+            ForwardOpts { alt: &alt, probe_port, proto: &proto, iface, source: &source, note: &note },
+        )?,
         Cmd::ForwardRm { id } => forward_rm_cli(&cfg, &id)?,
         Cmd::DnatForwards => dnat_forwards_cli(&cfg)?,
         Cmd::DnatMigrate { listen, iface } => dnat_migrate_cli(&cfg, &listen, &iface)?,
@@ -445,35 +461,73 @@ fn forwards_cli(cfg: &AgentConfig) -> Result<()> {
             .resolved_ip(f.id)
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "未解析".into());
+        let fo = store.failover(f.id);
+        let cur = f.target(fo.selected).unwrap_or_else(|| f.target(0).expect("目标 0 恒在"));
         println!(
             "  [{}] {} :{} → {}:{}  源={} 解析={}  id={}",
             proto_label(f.proto),
             iface,
             fmt_ports(&f.listen),
-            f.dest_host,
-            fmt_ports(&f.dest_port),
+            cur.host,
+            fmt_ports(&cur.port),
             src,
             resolved,
             f.id
         );
+        if f.target_count() > 1 {
+            // 实时延迟与存活只在服务进程内存里，这里只能看到持久化的选择。
+            for i in 0..f.target_count() {
+                let t = f.target(i).expect("下标在范围内");
+                let mark = if i == fo.selected { "*" } else { " " };
+                println!("      {mark} {}:{}", t.host, fmt_ports(&t.port));
+            }
+            if let Some(p) = f.probe_port {
+                println!("      探测端口 {p}");
+            }
+            if let Some(sw) = fo.last_switch {
+                let why = match sw.reason {
+                    ipgate_proto::SwitchReason::Down => "原目标判挂",
+                    ipgate_proto::SwitchReason::Latency => "另一目标更快",
+                };
+                println!(
+                    "      上次切换 {}：目标 {} → {}（{why}）",
+                    sw.at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S"),
+                    sw.from,
+                    sw.to
+                );
+            }
+        }
     }
     Ok(())
 }
 
-fn forward_add_cli(
-    cfg: &AgentConfig,
-    listen: &str,
-    dest: &str,
-    proto: &str,
+/// `forward-add` 除监听与主目标外的选项。
+struct ForwardOpts<'a> {
+    alt: &'a [String],
+    probe_port: Option<u16>,
+    proto: &'a str,
     iface: Option<String>,
-    source: &str,
-    note: &str,
-) -> Result<()> {
+    source: &'a str,
+    note: &'a str,
+}
+
+fn forward_add_cli(cfg: &AgentConfig, listen: &str, dest: &str, opts: ForwardOpts) -> Result<()> {
+    let ForwardOpts { alt, probe_port, proto, iface, source, note } = opts;
     let listen = parse_port_range(listen)?;
     let (host, dport) = dest
         .rsplit_once(':')
         .context("目标需 host:port 形式，如 10.0.0.9:8443")?;
     let dest_port = parse_port_range(dport)?;
+    let extra_targets = alt
+        .iter()
+        .map(|a| -> Result<ForwardTarget> {
+            // 不带端口的 host 用 --dest 的端口；IPv4 与域名里都没有冒号，rsplit 不会误切。
+            Ok(match a.rsplit_once(':') {
+                Some((h, p)) => ForwardTarget { host: h.trim().to_string(), port: parse_port_range(p)? },
+                None => ForwardTarget { host: a.trim().to_string(), port: dest_port },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let req = AddForwardRequest {
         proto: parse_proto(proto)?,
         iface,
@@ -482,8 +536,11 @@ fn forward_add_cli(
         dest_port,
         source: parse_source(source)?,
         note: note.to_string(),
+        extra_targets,
+        probe_port,
     };
     ipgate_proto::validate_ports(&req.listen, &req.dest_port).map_err(|e| anyhow::anyhow!(e))?;
+    req.validate_targets().map_err(|e| anyhow::anyhow!(e))?;
     if req.dest_host.is_empty() {
         anyhow::bail!("目标主机为空");
     }
@@ -494,9 +551,11 @@ fn forward_add_cli(
             anyhow::bail!("网卡名非法（仅允许字母数字与 . _ -，≤15 字符）");
         }
     }
-    if let Ok(ip) = req.dest_host.parse::<std::net::Ipv4Addr>() {
-        if let Some(why) = ipgate_proto::forbidden_forward_target(ip) {
-            anyhow::bail!("目标地址不允许：{why}");
+    for t in req.targets() {
+        if let Ok(ip) = t.host.parse::<std::net::Ipv4Addr>() {
+            if let Some(why) = ipgate_proto::forbidden_forward_target(ip) {
+                anyhow::bail!("目标地址 {ip} 不允许：{why}");
+            }
         }
     }
 
@@ -726,6 +785,11 @@ fn run(cfg: AgentConfig, interval: u64) -> Result<()> {
     {
         let (store, nat) = (store.clone(), nat.clone());
         std::thread::spawn(move || forward::resolve_loop(store, nat, interval));
+    }
+    // 多目标转发的探测与按延迟选择（ADR 0014）；没有多目标规则时每轮空转。
+    {
+        let (store, nat) = (store.clone(), nat.clone());
+        std::thread::spawn(move || failover::probe_loop(store, nat));
     }
 
     // ADR 0007：只在 loopback 监听 Noise；唯一入口是 SSH 隧道，对外零开放端口。

@@ -344,7 +344,10 @@ pub fn reset_root_password(password: String) -> ApiResult<()> {
 /// 构造单条转发的客户端视图：附上当前解析 IP 与是否生效。
 fn forward_view(store: &crate::store::Store, rule: ForwardRule) -> ForwardView {
     let resolved_ip = store.resolved_ip(rule.id);
+    let fo = store.failover(rule.id);
     ForwardView {
+        targets: crate::failover::statuses(&rule, fo.selected),
+        last_switch: fo.last_switch,
         rule,
         resolved_ip,
         active: resolved_ip.is_some(),
@@ -359,7 +362,12 @@ fn effective_iface(iface: &Option<String>) -> Option<String> {
 /// native 规则 → 统一视图（origin=ipgate，全增删改）。
 fn native_unified(store: &crate::store::Store, rule: ForwardRule) -> UnifiedForwardView {
     let resolved_ip = store.resolved_ip(rule.id);
+    let fo = store.failover(rule.id);
     UnifiedForwardView {
+        targets: crate::failover::statuses(&rule, fo.selected),
+        last_switch: fo.last_switch,
+        extra_targets: rule.extra_targets,
+        probe_port: rule.probe_port,
         origin: ForwardOrigin::Ipgate,
         proto: rule.proto,
         listen: rule.listen,
@@ -457,6 +465,10 @@ fn check_forward_request(st: &AppState, req: &AddForwardRequest) -> ApiResult<()
         return Err(ApiError::new(ErrorCode::BadRequest, "目标主机为空"));
     }
     validate_forward_input(&req.iface, &req.dest_host)?;
+    req.validate_targets().map_err(|e| ApiError::new(ErrorCode::BadRequest, e))?;
+    for t in &req.extra_targets {
+        validate_forward_input(&None, &t.host)?;
+    }
 
     // 碰撞检测（ADR 0006 排空模型）：监听端口被本机 dnat 规则占用则拒，引导先迁移。
     if st.dnat.present() {

@@ -72,6 +72,7 @@ sudo ipgate-agent pair --qr --host <服务器地址>   # 生成含隧道凭据�
 |------|------|
 | `nft` | `NftBackend` trait + `NftCli`（`nft` 子进程）；`ruleset.rs` 渲染 `inet ipgate` 原子事务、`nat.rs` 渲染 `ip ipgate_nat` 转发表（`NatBackend`）、`parse.rs` 解析 `nft -j` |
 | `forward` | 端口转发编排（ADR 0005）：解析目标/网卡/源 → 渲染 → 落地；`resolve` 域名解析、`netinfo` 网卡/默认路由/ip_forward |
+| `failover` | 多目标转发（ADR 0014）：5 秒一轮 TCP 握手探测、判挂与按延迟选择、切换后落地；`conntrack` 经 ctnetlink 删到失效目标的连接跟踪记录 |
 | `config` | `AgentConfig`（mgmt_port=loopback Noise 口、ssh_port/ssh_user、public_tcp/udp、data_dir）+ `validate()` 拒自锁 |
 | `store` | 条目/设备/转发 JSON 持久化（原子写）+ allow/revoke/prune/设备/转发管理 + 解析缓存 |
 | `reconcile` | 期望态 vs 内核态求 `Diff`（missing/stale/expired） |
@@ -95,6 +96,8 @@ ipgate-agent --config <path> allow <CIDR>    # 离线放行（写存储，安装
 ipgate-agent --config <path> revoke <CIDR>   # 离线撤销
 ipgate-agent --config <path> forwards        # 列端口转发规则（+ 当前解析 IP）
 ipgate-agent --config <path> forward-add --listen 443 --dest 10.0.0.9:8443 [--proto both] [--iface eth0] [--source auto]
+#   多目标（ADR 0014）：再加 [--alt host[:port]]...（缺省端口同 --dest）[--probe-port 22]（纯 UDP 必填），agent 按延迟选一个
+#   forwards 会列出各目标并用 * 标出当前在用的；实时延迟与存活只在服务进程内存里，CLI 看不到
 ipgate-agent --config <path> forward-rm <id> # 删端口转发（按 id）
 ipgate-agent --config <path> ssh-expose --open       # SSH 端口对所有人开放（控制台救援：解除「仅名单」自锁）
 ipgate-agent --config <path> ssh-expose --allowlist  # SSH 端口仅放行名单内源 IP 与敲过门的已配对设备可连（ADR 0012）

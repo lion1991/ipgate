@@ -4,11 +4,12 @@
 
 ## 步骤
 
-1. **proto + agent**（agent 0.2.13，先以预发布发出）：
+1. **proto + agent**（agent 0.2.13，先以预发布发出）：✅ 2026-11-16 代码与容器实测完成（见 ADR 0014「验证」），未发版。
    - proto：`ForwardRule` / `AddForwardRequest` 增额外目标列表与可选 TCP 探测端口（`serde(default)`，旧 state 原样读）；校验每个目标的端口段、纯 UDP 规则必须有探测端口；`ForwardView` 增各目标状态与上次切换信息。
    - agent：独立探测线程（5 秒一轮，各目标并发 connect）维护内存里的健康与延迟窗口；选择逻辑按 ADR 0014 决策 5–7 写成纯函数；选中目标变化时触发 `apply_now`，与 API、`resolve_loop` 的落地串行；`resolve_one` 对选中目标解析与做禁区检查。
    - 判挂切走时经 ctnetlink dump 并按回程源过滤后逐条删除 conntrack 记录（决策 9），失败只告警。
-   - CLI：`forward-add` 可重复给 `--target host[:port]` 与 `--probe-port`；`forwards` 打印各目标状态。
+   - CLI：`forward-add` 可重复给 `--alt host[:port]` 与 `--probe-port`；`forwards` 列出各目标、在用目标与上次切换（实时延迟只在服务内存里，CLI 看不到）。
+   - 私有 client 仓库同步补上新字段的空值，保证 core/ffi 能编译（多目标还没接）。
 2. **客户端 core + ffi**：暴露多目标、探测端口与目标状态字段；旧 agent 提示升级（≥ 0.2.13）。
 3. **Mac 客户端**（AppKit，ADR 0010）：编辑页增删目标、纯 UDP 时必填探测端口；列表与详情显示各目标延迟、存活、当前在用、上次切换时间与原因。
 4. **发布**：自己的主机先装预发布试用，没问题再转正式版。
