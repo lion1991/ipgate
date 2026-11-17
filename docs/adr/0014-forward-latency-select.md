@@ -30,7 +30,7 @@
 
 ## 展示
 
-`ForwardView` / `UnifiedForwardView` 增 `extra_targets`、`probe_port`，以及每个目标的状态（`targets`：存活 / 判挂 / 未探测、延迟中位数、是否当前在用）和规则级的 `last_switch`（时间、原因、前后目标下标）。旧 agent 不带这些字段，Mac 客户端据此提示升级。
+`ForwardView` / `UnifiedForwardView` 增 `extra_targets`、`probe_port`，以及每个目标的状态（`targets`：存活 / 判挂 / 未探测、延迟中位数、是否当前在用）和规则级的 `last_switch`（时间、原因、前后目标下标）。旧 agent 会忽略请求里的额外目标、静默按单目标保存，客户端在保存后核对返回的规则，发现额外目标没保存就提示升级（客户端拿不到 agent 版本，无法事先判断）。
 
 选中目标与上次切换持久化在 `state.json` 的 `failover`（重启后流量不跳回目标 0；`resolved` 始终是选中目标的 IP）。健康与延迟只在服务进程内存里，重启后从「未探测」重新攒；所以 `ipgate-agent forwards`（独立进程）只能列出各目标、标出当前在用的和上次切换，看不到实时延迟。
 
