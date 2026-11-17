@@ -358,7 +358,8 @@ impl Store {
     }
 
     /// 原地修改规则，保留 id 与创建信息。选中目标变了就丢掉旧解析缓存——否则新域名解析失败时
-    /// 会回退到旧目标 IP。目标列表变了选择重置为目标 0（下标已对不上）。
+    /// 会回退到旧目标 IP。目标列表变了：原来在用的目标（host 不分大小写 + 端口）还在就沿用它的新下标，
+    /// 不在才退回目标 0——改一个无关目标不该把流量切回可能正挂着的目标 0。上次切换的下标已对不上，丢掉。
     pub fn update_forward(&mut self, id: ForwardId, req: AddForwardRequest) -> Option<ForwardRule> {
         let rule = self.state.forwards.iter_mut().find(|f| f.id == id)?;
         let old_targets: Vec<_> = (0..rule.target_count()).filter_map(|i| rule.target(i)).collect();
@@ -367,8 +368,19 @@ impl Store {
         let new_sel = if old_targets == new_targets {
             old_sel
         } else {
-            self.state.failover.remove(&id);
-            0
+            let keep = old_targets.get(old_sel).and_then(|o| {
+                new_targets.iter().position(|t| t.host.eq_ignore_ascii_case(&o.host) && t.port == o.port)
+            });
+            match keep {
+                Some(i) if i > 0 => {
+                    self.state.failover.insert(id, FailoverState { selected: i, last_switch: None });
+                    i
+                }
+                _ => {
+                    self.state.failover.remove(&id);
+                    0
+                }
+            }
         };
         if old_targets.get(old_sel).map(|t| &t.host) != new_targets.get(new_sel).map(|t| &t.host) {
             self.state.resolved.remove(&id);
@@ -636,7 +648,18 @@ mod tests {
         s.update_forward(r.id, same).unwrap();
         assert_eq!(s.failover(r.id).selected, 1);
 
-        // 目标列表变了：重置到 0
+        // 追加目标、在用的 b.com 还在：沿用它，缓存也留着；上次切换的下标对不上了，丢掉
+        s.set_resolved([(r.id, "10.0.0.2".parse().unwrap())].into());
+        let mut appended = req.clone();
+        appended.extra_targets.insert(0, ForwardTarget { host: "c.com".into(), port: PortRange::single(80) });
+        s.update_forward(r.id, appended).unwrap();
+        assert_eq!(s.failover(r.id).selected, 2);
+        assert!(s.failover(r.id).last_switch.is_none());
+        assert_eq!(s.resolved_ip(r.id), Some("10.0.0.2".parse().unwrap()));
+        s.update_forward(r.id, req.clone()).unwrap();
+        assert_eq!(s.failover(r.id).selected, 1);
+
+        // 在用的目标被换掉：重置到 0
         let mut changed = req.clone();
         changed.extra_targets[0].host = "c.com".into();
         s.update_forward(r.id, changed).unwrap();

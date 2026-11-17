@@ -191,7 +191,13 @@ pub fn flush(f: &Filter) -> anyhow::Result<usize> {
         let buf = sock.recv()?;
         for (ty, p) in messages(&buf) {
             match ty {
-                NLMSG_DONE => break 'dump,
+                // dump 中途出错时内核把 errno 放在 DONE 的载荷里。
+                NLMSG_DONE => {
+                    if p.len() >= 4 && error_code(p) < 0 {
+                        anyhow::bail!("conntrack dump 失败：errno {}", -error_code(p));
+                    }
+                    break 'dump;
+                }
                 NLMSG_ERROR => {
                     let e = error_code(p);
                     if e != 0 {
@@ -284,15 +290,21 @@ mod linux {
 
         pub fn recv(&self) -> io::Result<Vec<u8>> {
             let mut buf = vec![0u8; 1 << 18];
-            // SAFETY: buf 可写长度即传入长度。
-            let n = unsafe {
-                libc::recv(self.0.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
-            };
-            if n < 0 {
-                return Err(io::Error::last_os_error());
+            loop {
+                // SAFETY: buf 可写长度即传入长度。
+                let n = unsafe {
+                    libc::recv(self.0.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+                };
+                if n >= 0 {
+                    buf.truncate(n as usize);
+                    return Ok(buf);
+                }
+                let e = io::Error::last_os_error();
+                // 设了 SO_RCVTIMEO 的 recv 被信号打断不会自动重启。
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
             }
-            buf.truncate(n as usize);
-            Ok(buf)
         }
     }
 }

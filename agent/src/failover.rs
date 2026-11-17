@@ -32,6 +32,8 @@ const UP_AFTER: u32 = 2;
 const HOLD: Duration = Duration::from_secs(60);
 /// 快多少才算「更快」：低于当前的 80%，且至少快这么多微秒。
 const MIN_GAIN_US: u32 = 10_000;
+/// 清 conntrack 连续失败几次就不再试（比如内核没加载 ctnetlink），免得每轮刷告警。
+const MAX_FLUSH_TRIES: u8 = 3;
 
 /// 一个目标的探测状态。
 #[derive(Debug, Clone)]
@@ -42,11 +44,23 @@ pub struct TargetState {
     samples: VecDeque<u32>,
     /// 最近一次解析成功的 IP（域名解析失败时回退，也供落地用）。
     pub ip: Option<Ipv4Addr>,
+    /// 判挂后待清 conntrack 的 IP：不管它当时是不是在用目标，按延迟切走后留在它上面的
+    /// 长连接（尤其持续发包的 UDP 流）也得清掉才会改走别的目标。清掉或恢复后置空。
+    flush_ip: Option<Ipv4Addr>,
+    flush_tries: u8,
 }
 
 impl Default for TargetState {
     fn default() -> Self {
-        TargetState { health: TargetHealth::Unknown, ok: 0, fail: 0, samples: VecDeque::new(), ip: None }
+        TargetState {
+            health: TargetHealth::Unknown,
+            ok: 0,
+            fail: 0,
+            samples: VecDeque::new(),
+            ip: None,
+            flush_ip: None,
+            flush_tries: 0,
+        }
     }
 }
 
@@ -63,6 +77,7 @@ impl TargetState {
                 }
                 if self.health != TargetHealth::Up && self.ok >= UP_AFTER {
                     self.health = TargetHealth::Up;
+                    self.flush_ip = None;
                 }
             }
             None => {
@@ -72,6 +87,8 @@ impl TargetState {
                     self.health = TargetHealth::Down;
                     // 恢复后按新样本算延迟，不拿挂之前的数比。
                     self.samples.clear();
+                    self.flush_ip = self.ip;
+                    self.flush_tries = 0;
                 }
             }
         }
@@ -206,21 +223,30 @@ fn probe(t: &ForwardTarget, port: u16, prev_ip: Option<Ipv4Addr>) -> (Option<Ipv
 struct Switch {
     rule: ForwardRule,
     sw: ForwardSwitch,
-    /// 判挂切走时旧目标的 IP（落地后清它的 conntrack）。
-    dead_ip: Option<Ipv4Addr>,
 }
 
 /// 探测期间规则可能被删改：规则还在、目标没变、选中的仍是 `from` 才写入切换。
-/// 判挂时清 conntrack 用实际 DNAT 到的 IP（`resolved`），没有才用探测解析到的。
+/// 判挂切走时，旧目标待清的 IP 换成实际 DNAT 到的（`resolved`），域名换过解析也清得对。
 fn accept(s: &mut Store, mut sw: Switch) -> Option<Switch> {
-    let now = s.find_forward(sw.rule.id)?;
-    if fingerprint(now) != fingerprint(&sw.rule) || s.failover(sw.rule.id).selected != sw.sw.from {
+    let now = s.find_forward(sw.rule.id)?.clone();
+    let key = fingerprint(&now);
+    if key != fingerprint(&sw.rule) || s.failover(now.id).selected != sw.sw.from {
         return None;
     }
     if sw.sw.reason == SwitchReason::Down {
-        sw.dead_ip = s.resolved_ip(sw.rule.id).or(sw.dead_ip);
+        if let Some(ip) = s.resolved_ip(now.id) {
+            let mut health = HEALTH.lock_safe();
+            let t = health
+                .get_mut(&now.id)
+                .filter(|st| st.key == key)
+                .and_then(|st| st.targets.get_mut(sw.sw.from));
+            if let Some(t) = t {
+                t.flush_ip = Some(ip);
+            }
+        }
     }
-    s.set_selected(sw.rule.id, sw.sw);
+    s.set_selected(now.id, sw.sw);
+    sw.rule = now;
     Some(sw)
 }
 
@@ -265,10 +291,14 @@ fn round(store: &Arc<Mutex<Store>>) -> Vec<Switch> {
     let total = jobs.len();
     for (ri, ti, t, port, prev) in jobs.iter().cloned() {
         let tx = tx.clone();
-        std::thread::spawn(move || {
+        // 起不了线程（如碰到 TasksMax）就当这次探测失败，不让探测线程整个 panic。
+        let spawned = std::thread::Builder::new().spawn(move || {
             let (ip, us) = probe(&t, port, prev);
             let _ = tx.send((ri, ti, ip, us));
         });
+        if let Err(e) = spawned {
+            warn!(error = %e, "转发：探测线程启动失败");
+        }
     }
     drop(tx);
     let deadline = Instant::now() + ROUND_DEADLINE;
@@ -305,12 +335,8 @@ fn round(store: &Arc<Mutex<Store>>) -> Vec<Switch> {
     for (rule, selected) in rules {
         let Some(st) = health.get_mut(&rule.id) else { continue };
         if let Some((to, reason)) = decide(selected, &st.targets, &mut st.candidate, now) {
-            let dead_ip = match reason {
-                SwitchReason::Down => st.targets[selected].ip,
-                SwitchReason::Latency => None,
-            };
             let sw = ForwardSwitch { at: Utc::now(), from: selected, to, reason };
-            out.push(Switch { rule, sw, dead_ip });
+            out.push(Switch { rule, sw });
         }
     }
     out
@@ -318,6 +344,9 @@ fn round(store: &Arc<Mutex<Store>>) -> Vec<Switch> {
 
 /// 探测循环（独立阻塞线程）。
 pub fn probe_loop(store: Arc<Mutex<Store>>, nat: Arc<dyn NatBackend + Send + Sync>) {
+    // 切换写进了 store 但落地失败：内核里可能还 DNAT 到旧目标，这时清它的 conntrack，
+    // 新包又会按旧规则建回去。先补落地，成功了再清。
+    let mut apply_pending = false;
     loop {
         let start = Instant::now();
         let switches = round(&store);
@@ -335,33 +364,87 @@ pub fn probe_loop(store: Arc<Mutex<Store>>, nat: Arc<dyn NatBackend + Send + Syn
                     "转发：切换目标"
                 );
             }
-            match applied {
-                Ok(_) => {
-                    // 先落新规则再删旧记录：删掉后下一个包按新规则 DNAT。
-                    for sw in &switches {
-                        flush_dead(sw);
-                    }
+            apply_pending = match applied {
+                Ok(_) => false,
+                Err(e) => {
+                    warn!(error = %e, "转发：切换后落地失败（下一轮重试）");
+                    true
                 }
-                Err(e) => warn!(error = %e, "转发：切换后落地失败（周期重解析会重试）"),
-            }
+            };
+        } else if apply_pending {
+            apply_pending = match forward::apply_now(&store, &nat) {
+                Ok(_) => false,
+                Err(e) => {
+                    warn!(error = %e, "转发：补落地失败（下一轮重试）");
+                    true
+                }
+            };
+        }
+        if !apply_pending {
+            flush_down(&store);
         }
         std::thread::sleep(PROBE_INTERVAL.saturating_sub(start.elapsed()));
     }
 }
 
-fn flush_dead(sw: &Switch) {
-    let (Some(ip), Some(t)) = (sw.dead_ip, sw.rule.target(sw.sw.from)) else { return };
-    let f = conntrack::Filter {
-        target_ip: ip,
-        target_ports: t.port,
-        listen: sw.rule.listen,
-        protos: conntrack::l4_numbers(sw.rule.proto),
+type FlushJob = (ForwardId, Vec<(ForwardTarget, u16)>, usize, conntrack::Filter);
+
+/// 清掉到已判挂、且不是当前在用目标的连接跟踪记录。在用目标挂了但没得切时不清：
+/// 规则还指着它，清了新包也会再建回去。失败的下一轮重试，最多 [`MAX_FLUSH_TRIES`] 次。
+fn flush_down(store: &Arc<Mutex<Store>>) {
+    let jobs = {
+        let s = store.lock_safe();
+        let health = HEALTH.lock_safe();
+        flush_jobs(&s, &health)
     };
-    match conntrack::flush(&f) {
-        Ok(0) => {}
-        Ok(n) => info!(target = %ip, removed = n, "转发：已清除到失效目标的连接跟踪记录"),
-        Err(e) => warn!(error = %e, target = %ip, "转发：清除连接跟踪记录失败"),
+    for (id, key, i, f) in jobs {
+        let result = conntrack::flush(&f);
+        let mut health = HEALTH.lock_safe();
+        let Some(t) = health.get_mut(&id).filter(|st| st.key == key).and_then(|st| st.targets.get_mut(i))
+        else {
+            continue;
+        };
+        match result {
+            Ok(n) => {
+                if n > 0 {
+                    info!(target = %f.target_ip, removed = n, "转发：已清除到失效目标的连接跟踪记录");
+                }
+                t.flush_ip = None;
+            }
+            Err(e) => {
+                t.flush_tries += 1;
+                let give_up = t.flush_tries >= MAX_FLUSH_TRIES;
+                warn!(error = %e, target = %f.target_ip, give_up, "转发：清除连接跟踪记录失败");
+                if give_up {
+                    t.flush_ip = None;
+                }
+            }
+        }
     }
+}
+
+/// 该清哪些：已判挂、有待清 IP、且不是当前在用的目标。过滤条件用规则当前的监听段与协议。
+fn flush_jobs(s: &Store, health: &HashMap<ForwardId, RuleState>) -> Vec<FlushJob> {
+    let mut jobs = Vec::new();
+    for rule in s.forwards().iter().filter(|r| r.target_count() > 1) {
+        let key = fingerprint(rule);
+        let Some(st) = health.get(&rule.id).filter(|st| st.key == key) else { continue };
+        let selected = s.failover(rule.id).selected;
+        for (i, t) in st.targets.iter().enumerate() {
+            let (Some(ip), Some(target)) = (t.flush_ip, rule.target(i)) else { continue };
+            if i == selected || t.health != TargetHealth::Down {
+                continue;
+            }
+            let f = conntrack::Filter {
+                target_ip: ip,
+                target_ports: target.port,
+                listen: rule.listen,
+                protos: conntrack::l4_numbers(rule.proto),
+            };
+            jobs.push((rule.id, key.clone(), i, f));
+        }
+    }
+    jobs
 }
 
 #[cfg(test)]
@@ -530,15 +613,25 @@ mod tests {
         let mk = |from, to| Switch {
             rule: rule.clone(),
             sw: ForwardSwitch { at: Utc::now(), from, to, reason: SwitchReason::Down },
-            dead_ip: Some("10.9.9.9".parse().unwrap()),
         };
+        let mut dead = down();
+        dead.flush_ip = Some("10.9.9.9".parse().unwrap());
+        HEALTH.lock_safe().insert(
+            rule.id,
+            RuleState { key: fingerprint(&rule), targets: vec![dead, up(1000)], candidate: None },
+        );
 
         // from 对不上当前选中
         assert!(accept(&mut s, mk(1, 0)).is_none());
-        // 正常：dead_ip 用实际落地的 IP
-        let ok = accept(&mut s, mk(0, 1)).unwrap();
-        assert_eq!(ok.dead_ip, Some("10.0.0.1".parse().unwrap()));
+        // 正常：待清的 IP 换成实际落地的 IP
+        accept(&mut s, mk(0, 1)).unwrap();
+        assert_eq!(HEALTH.lock_safe()[&rule.id].targets[0].flush_ip, Some("10.0.0.1".parse().unwrap()));
         assert_eq!(s.failover(rule.id).selected, 1);
+        // 判挂且不在用的目标 0 要清，用规则当前的监听段
+        let jobs = flush_jobs(&s, &HEALTH.lock_safe());
+        assert_eq!(jobs.len(), 1);
+        assert_eq!((jobs[0].2, jobs[0].3.target_ip, jobs[0].3.listen), (0, "10.0.0.1".parse().unwrap(), rule.listen));
+        HEALTH.lock_safe().remove(&rule.id);
 
         // 规则目标被改过
         let mut changed = req.clone();
@@ -551,6 +644,63 @@ mod tests {
         s.remove_forward(rule.id);
         assert!(accept(&mut s, mk(0, 1)).is_none());
         assert_eq!(s.failover(rule.id), crate::store::FailoverState::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn down_marks_flush_until_recovered() {
+        let mut t = TargetState { ip: Some("10.0.0.1".parse().unwrap()), ..Default::default() };
+        t.record(Some(1000));
+        t.record(Some(1000));
+        for _ in 0..DOWN_AFTER {
+            t.record(None);
+        }
+        assert_eq!(t.flush_ip, Some("10.0.0.1".parse().unwrap()));
+        for _ in 0..UP_AFTER {
+            t.record(Some(1000));
+        }
+        assert_eq!((t.health, t.flush_ip), (TargetHealth::Up, None));
+    }
+
+    #[test]
+    fn flush_skips_selected_and_live_targets() {
+        use ipgate_proto::AddForwardRequest;
+        let dir = std::env::temp_dir().join(format!("ipgate-fo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = Store::load(&dir.join("state.json")).unwrap();
+        let tmpl = multi_rule();
+        let req = AddForwardRequest {
+            proto: tmpl.proto,
+            iface: None,
+            listen: tmpl.listen,
+            dest_host: tmpl.dest_host.clone(),
+            dest_port: tmpl.dest_port,
+            source: tmpl.source,
+            note: String::new(),
+            extra_targets: tmpl.extra_targets.clone(),
+            probe_port: None,
+        };
+        let rule = s.add_forward(req, tmpl.created_by, Utc::now());
+        let ip = Some("10.0.0.1".parse().unwrap());
+        let mut health = HashMap::new();
+        // 在用的目标 0 判挂但没得切：不清（规则还指着它）。
+        let both_down = |a: Option<Ipv4Addr>| {
+            let mut d = down();
+            d.flush_ip = a;
+            d
+        };
+        health.insert(
+            rule.id,
+            RuleState { key: fingerprint(&rule), targets: vec![both_down(ip), both_down(None)], candidate: None },
+        );
+        assert!(flush_jobs(&s, &health).is_empty());
+        // 按延迟切到 1 之后，0 才挂：要清 0。
+        s.set_selected(rule.id, ForwardSwitch { at: Utc::now(), from: 0, to: 1, reason: SwitchReason::Latency });
+        let jobs = flush_jobs(&s, &health);
+        assert_eq!(jobs.iter().map(|j| j.2).collect::<Vec<_>>(), [0]);
+        // 0 恢复了：不清。
+        health.get_mut(&rule.id).unwrap().targets[0] = up(1000);
+        assert!(flush_jobs(&s, &health).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
