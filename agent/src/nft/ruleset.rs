@@ -22,6 +22,13 @@ time-exceeded, parameter-problem";
 const ICMP_INFRA_TYPES: &str =
     "destination-unreachable, time-exceeded, parameter-problem";
 
+/// 敲门日志前缀（ADR 0012 决策 10）：开门、敲错、经敲门放行的 SSH 新连接。
+const KNOCK_LOG_OK: &str = "ipgate knock ok: ";
+const KNOCK_LOG_BAD: &str = "ipgate knock bad: ";
+const KNOCK_LOG_SSH: &str = "ipgate knock ssh: ";
+/// 每条敲门日志规则各自的限速，防重放 / 伪造源刷爆内核日志。
+const KNOCK_LOG_LIMIT: &str = "limit rate 10/minute burst 10 packets";
+
 /// 返回 `inet ipgate` 这个表的限定名（`inet ipgate`）。
 fn table() -> String {
     format!("inet {NFT_TABLE}")
@@ -144,6 +151,8 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
     ));
     // 敲门（ADR 0012）：载荷前 16 字节等于口令 → 记下源 IP 并丢弃，不回应。只丢口令匹配的包，
     // 派生端口撞上真实 UDP 服务时其余包照常往下走。
+    // 日志进内核日志（`journalctl -k -g ipgate`）：只记开门那一包（源 IP 还不在 set 里），
+    // 门开着时的补敲与续期不记；限速只挂在无裁决的日志规则上，超限只少记，不影响放行。
     if let Some(k) = knock {
         let m = format!(
             "udp dport {} @th,64,128 0x{}",
@@ -151,10 +160,21 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
             crate::util::to_hex(&k.token)
         );
         s.push_str(&format!(
+            "        meta nfproto ipv4 {m} ip saddr != @{NFT_SET_KNOCK4} {KNOCK_LOG_LIMIT} log prefix \"{KNOCK_LOG_OK}\" level info\n"
+        ));
+        s.push_str(&format!(
             "        meta nfproto ipv4 {m} update @{NFT_SET_KNOCK4} {{ ip saddr timeout {KNOCK_TTL_SECS}s }} drop\n"
         ));
         s.push_str(&format!(
+            "        meta nfproto ipv6 {m} ip6 saddr != @{NFT_SET_KNOCK6} {KNOCK_LOG_LIMIT} log prefix \"{KNOCK_LOG_OK}\" level info\n"
+        ));
+        s.push_str(&format!(
             "        meta nfproto ipv6 {m} update @{NFT_SET_KNOCK6} {{ ip6 saddr timeout {KNOCK_TTL_SECS}s }} drop\n"
+        ));
+        // 口令对的包上面已丢弃；到这里的 16 字节载荷包按敲错记（多为重置 access key 后没重新配对的设备）。
+        s.push_str(&format!(
+            "        udp dport {} udp length 24 {KNOCK_LOG_LIMIT} log prefix \"{KNOCK_LOG_BAD}\" level info\n",
+            k.port
         ));
     }
     // SSH 管理端口（ADR 0007 唯一入口）。默认无条件放行（自锁不变量，最稳）；开启
@@ -166,6 +186,14 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
             cfg.ssh_port
         ));
         if knock.is_some() {
+            s.push_str(&format!(
+                "        tcp dport {} ip saddr @{NFT_SET_KNOCK4} {KNOCK_LOG_LIMIT} log prefix \"{KNOCK_LOG_SSH}\" level info\n",
+                cfg.ssh_port
+            ));
+            s.push_str(&format!(
+                "        tcp dport {} ip6 saddr @{NFT_SET_KNOCK6} {KNOCK_LOG_LIMIT} log prefix \"{KNOCK_LOG_SSH}\" level info\n",
+                cfg.ssh_port
+            ));
             s.push_str(&format!(
                 "        tcp dport {} ip saddr @{NFT_SET_KNOCK4} accept\n",
                 cfg.ssh_port
@@ -408,7 +436,19 @@ mod tests {
         assert!(!s.contains("tcp dport 22 accept"));
         assert!(s.contains("ip saddr @allow4 accept"));
         // 不回应：没有对错误口令的 reject / 显式 drop 规则，错口令包照常落到 policy drop。
-        assert_eq!(s.matches("udp dport 44707").count(), 2);
+        assert_eq!(s.matches("udp dport 44707").count(), 5);
+
+        // 日志：开门那包先记再入 set；敲错与经敲门的 SSH 新连接各记一条。日志规则都不带裁决。
+        let lim = "limit rate 10/minute burst 10 packets";
+        let l4 = at(&format!("meta nfproto ipv4 udp dport 44707 @th,64,128 0x{tok} ip saddr != @knock4 {lim} log prefix \"ipgate knock ok: \" level info"));
+        let l6 = at(&format!("meta nfproto ipv6 udp dport 44707 @th,64,128 0x{tok} ip6 saddr != @knock6 {lim} log prefix \"ipgate knock ok: \" level info"));
+        assert!(l4 < k4 && l6 < k6, "开门日志须在写 set 之前，否则 != 永远不成立");
+        let bad = at(&format!("udp dport 44707 udp length 24 {lim} log prefix \"ipgate knock bad: \" level info"));
+        assert!(k4 < bad && k6 < bad, "敲错日志须在口令匹配规则之后");
+        let ls4 = at(&format!("tcp dport 22 ip saddr @knock4 {lim} log prefix \"ipgate knock ssh: \" level info"));
+        let ls6 = at(&format!("tcp dport 22 ip6 saddr @knock6 {lim} log prefix \"ipgate knock ssh: \" level info"));
+        assert!(ls4 < s4 && ls6 < s6);
+        assert!(lines.iter().filter(|l| l.contains("log prefix")).all(|l| !l.ends_with("accept") && !l.ends_with("drop")));
     }
 
     #[test]

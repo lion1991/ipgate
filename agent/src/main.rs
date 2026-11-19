@@ -996,7 +996,7 @@ fn status(cfg: &AgentConfig) -> Result<()> {
         }
     }
     if let Some(k) = &cfg.ssh_knock {
-        println!("SSH 敲门端口：UDP {}（仅名单时生效；云安全组须放行）", k.port);
+        println!("SSH 敲门端口：UDP {}（仅名单时生效；云安全组须放行）；敲门日志：journalctl -k -g 'ipgate knock'", k.port);
     }
     for p in cfg.config_public_ports().iter().chain(store.public_ports()) {
         let src = if p.from_config { "config.json" } else { "客户端添加" };
