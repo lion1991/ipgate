@@ -57,6 +57,8 @@ impl Gate {
 pub struct Applied {
     pub gate: Gate,
     pub knock: Gate,
+    /// 敲门日志（ADR 0012 决策 10）；被拒时只去日志，敲门照常。
+    pub knock_log: Gate,
 }
 
 /// 最近一次整表 apply 后可选能力的生效态；RPC 与对账线程共享，供 `AgentSettings` 上报。
@@ -76,7 +78,8 @@ impl Live {
 /// 整表应用 ruleset，返回两项可选能力的实际状态。
 ///
 /// 带可选能力的 ruleset 加载失败（如老内核/老 nft 不认 `ct status` 或 `@th` / 动态 set）时，
-/// 告警并逐级退回：先去敲门留门，再去门留敲门，最后都去掉。事务原子，失败时内核仍是旧表——
+/// 告警并逐级退回：先只去敲门日志，再去敲门留门，再去门留敲门（同样先带日志），最后都去掉。
+/// 事务原子，失败时内核仍是旧表——
 /// 可选能力的问题绝不能连带 input 链（SSH 入口、放行名单）落地失败。
 pub fn apply_ruleset(
     backend: &dyn NftBackend,
@@ -85,6 +88,7 @@ pub fn apply_ruleset(
 ) -> anyhow::Result<Applied> {
     let want_gate = cfg.forward_allowlist_only;
     let want_knock = cfg.knock().is_some();
+    let want_log = want_knock && cfg.ssh_knock_log;
     // nft 报错会回显出错的源码行；敲门规则那行带口令，进日志 / RPC 错误前先抹掉。
     let token = cfg.ssh_knock.as_ref().map(|k| crate::util::to_hex(&k.token));
     let redact = |e: anyhow::Error| {
@@ -94,17 +98,27 @@ pub fn apply_ruleset(
             None => s,
         })
     };
-    let mut tried: Vec<(bool, bool)> = Vec::new();
+    let (k, l, g) = (want_knock, want_log, want_gate);
+    let ladder = [
+        (k, l, g),
+        (k, false, g),
+        (false, false, g),
+        (k, l, false),
+        (k, false, false),
+        (false, false, false),
+    ];
+    let mut tried: Vec<(bool, bool, bool)> = Vec::new();
     let mut first_err: Option<anyhow::Error> = None;
-    for cand in [(want_knock, want_gate), (false, want_gate), (want_knock, false), (false, false)] {
+    for cand in ladder {
         if tried.contains(&cand) {
             continue;
         }
         tried.push(cand);
-        let (knock, gate) = cand;
+        let (knock, log, gate) = cand;
         let c = RulesetConfig {
             forward_allowlist_only: gate,
             ssh_knock: if knock { cfg.ssh_knock.clone() } else { None },
+            ssh_knock_log: log,
             ..cfg.clone()
         };
         match backend.apply(&c, entries).map_err(redact) {
@@ -115,19 +129,27 @@ pub fn apply_ruleset(
                     (true, true) => Gate::Active,
                     (true, false) => Gate::Rejected(reason.clone()),
                 };
-                let applied = Applied { gate: state(want_gate, gate), knock: state(want_knock, knock) };
+                let applied = Applied {
+                    gate: state(want_gate, gate),
+                    knock: state(want_knock, knock),
+                    // 敲门本身没了，日志无从谈起，不另报。
+                    knock_log: if knock { state(want_log, log) } else { Gate::Off },
+                };
                 if let Gate::Rejected(e) = &applied.gate {
                     tracing::warn!(error = %e, "转发名单门加载失败，已退回无门 ruleset（转发对全网开放）");
                 }
                 if let Gate::Rejected(e) = &applied.knock {
                     tracing::warn!(error = %e, "SSH 敲门规则加载失败，已退回不带敲门的 ruleset（SSH 仅名单可连）");
                 }
+                if let Gate::Rejected(e) = &applied.knock_log {
+                    tracing::warn!(error = %e, "敲门日志规则加载失败（常见原因：内核缺 nf_log_syslog），已去掉日志，敲门照常");
+                }
                 return Ok(applied);
             }
             Err(e) => {
                 if first_err.is_none() {
                     first_err = Some(e);
-                } else if cand == (false, false) {
+                } else if cand == (false, false, false) {
                     return Err(e);
                 }
             }
@@ -157,23 +179,30 @@ mod tests {
         gate_ok: bool,
         knock_ok: bool,
         plain_ok: bool,
-        applied: Mutex<Vec<(bool, bool)>>,
+        /// false：模拟内核缺日志后端，带敲门日志的 ruleset 被拒。
+        log_ok: bool,
+        /// 每次成功 apply 的 (敲门, 敲门日志, 转发门)。
+        applied: Mutex<Vec<(bool, bool, bool)>>,
     }
 
     impl Recorder {
         fn new(gate_ok: bool, knock_ok: bool, plain_ok: bool) -> Self {
-            Self { gate_ok, knock_ok, plain_ok, applied: Mutex::new(Vec::new()) }
+            Self { gate_ok, knock_ok, plain_ok, log_ok: true, applied: Mutex::new(Vec::new()) }
         }
     }
 
     impl NftBackend for Recorder {
         fn apply(&self, cfg: &RulesetConfig, _entries: &[Entry]) -> anyhow::Result<()> {
             let (knock, gate) = (cfg.knock().is_some(), cfg.forward_allowlist_only);
-            let ok = self.plain_ok && (!gate || self.gate_ok) && (!knock || self.knock_ok);
+            let log = knock && cfg.ssh_knock_log;
+            let ok = self.plain_ok
+                && (!gate || self.gate_ok)
+                && (!knock || self.knock_ok)
+                && (!log || self.log_ok);
             if !ok {
                 anyhow::bail!("nft -f 失败");
             }
-            self.applied.lock().unwrap().push((knock, gate));
+            self.applied.lock().unwrap().push((knock, log, gate));
             Ok(())
         }
         fn add(&self, _: &Entry) -> anyhow::Result<()> {
@@ -200,7 +229,7 @@ mod tests {
         }
     }
 
-    fn applied(b: &Recorder) -> Vec<(bool, bool)> {
+    fn applied(b: &Recorder) -> Vec<(bool, bool, bool)> {
         b.applied.lock().unwrap().clone()
     }
 
@@ -209,7 +238,8 @@ mod tests {
         let b = Recorder::new(true, true, true);
         let a = apply_ruleset(&b, &cfg(true, true), &[]).unwrap();
         assert!(a.gate.active() && a.knock.active());
-        assert_eq!(applied(&b), vec![(true, true)]);
+        assert!(a.knock_log.active());
+        assert_eq!(applied(&b), vec![(true, true, true)]);
     }
 
     #[test]
@@ -222,7 +252,7 @@ mod tests {
             g => panic!("期望 Rejected，得到 {g:?}"),
         }
         assert!(a.knock.active());
-        assert_eq!(applied(&b), vec![(true, false)]);
+        assert_eq!(applied(&b), vec![(true, true, false)]);
     }
 
     #[test]
@@ -231,7 +261,7 @@ mod tests {
         let a = apply_ruleset(&b, &cfg(true, true), &[]).unwrap();
         assert!(matches!(a.knock, Gate::Rejected(_)));
         assert!(a.gate.active());
-        assert_eq!(applied(&b), vec![(false, true)]);
+        assert_eq!(applied(&b), vec![(false, false, true)]);
     }
 
     #[test]
@@ -239,7 +269,26 @@ mod tests {
         let b = Recorder::new(false, false, true);
         let a = apply_ruleset(&b, &cfg(true, true), &[]).unwrap();
         assert!(matches!((&a.gate, &a.knock), (Gate::Rejected(_), Gate::Rejected(_))));
-        assert_eq!(applied(&b), vec![(false, false)]);
+        assert_eq!(applied(&b), vec![(false, false, false)]);
+    }
+
+    #[test]
+    fn log_rejected_keeps_knock_and_gate() {
+        // 内核缺 nf_log_syslog：只去掉敲门日志，敲门与转发门照常（不能因日志丢了敲门）。
+        let b = Recorder { log_ok: false, ..Recorder::new(true, true, true) };
+        let a = apply_ruleset(&b, &cfg(true, true), &[]).unwrap();
+        assert!(a.knock.active() && a.gate.active());
+        assert!(matches!(a.knock_log, Gate::Rejected(_)));
+        assert_eq!(applied(&b), vec![(true, false, true)]);
+    }
+
+    #[test]
+    fn log_and_gate_rejected_keeps_knock() {
+        let b = Recorder { log_ok: false, ..Recorder::new(false, true, true) };
+        let a = apply_ruleset(&b, &cfg(true, true), &[]).unwrap();
+        assert!(a.knock.active());
+        assert!(matches!((&a.gate, &a.knock_log), (Gate::Rejected(_), Gate::Rejected(_))));
+        assert_eq!(applied(&b), vec![(true, false, false)]);
     }
 
     #[test]

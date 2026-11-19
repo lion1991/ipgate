@@ -21,6 +21,10 @@ pub struct RulesetConfig {
     /// `None` = 不渲染敲门规则（内核不支持时的降级）。含口令，不序列化。
     #[serde(skip)]
     pub ssh_knock: Option<SshKnock>,
+    /// 敲门规则旁是否渲染内核日志规则（ADR 0012 决策 10）。内核缺日志后端（`nf_log_syslog`）
+    /// 时带日志的 ruleset 会被整体拒绝，agent 置 false 重试，只丢日志、保留敲门。
+    #[serde(skip, default = "yes")]
+    pub ssh_knock_log: bool,
     /// 转发名单门（ADR 0008）：被 DNAT 进来的新建连接（native 转发 / dnat 工具 / Docker `-p`）
     /// 是否也仅放行名单内源 IP 与公开端口。默认 false = 不接管 forward hook，转发对全网开放。
     #[serde(default)]
@@ -43,12 +47,17 @@ impl Default for RulesetConfig {
             ssh_port: crate::DEFAULT_SSH_PORT,
             ssh_allowlist_only: false,
             ssh_knock: None,
+            ssh_knock_log: true,
             forward_allowlist_only: false,
             open_all: false,
             public_tcp: Vec::new(),
             public_udp: Vec::new(),
         }
     }
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl RulesetConfig {

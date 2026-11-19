@@ -130,6 +130,7 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
     s.push_str(&set_def(NFT_SET_PUBLIC_TCP, "inet_service", "interval", &tcp));
     s.push_str(&set_def(NFT_SET_PUBLIC_UDP, "inet_service", "interval", &udp));
     let knock = cfg.knock();
+    let log = cfg.ssh_knock_log;
     if knock.is_some() {
         // 由下方敲门规则在包路径上动态写入（ADR 0012）；整表重建会清空，已建立连接不受影响。
         s.push_str(&set_def(NFT_SET_KNOCK4, "ipv4_addr", "dynamic, timeout", ""));
@@ -159,23 +160,29 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
             k.port,
             crate::util::to_hex(&k.token)
         );
-        s.push_str(&format!(
-            "        meta nfproto ipv4 {m} ip saddr != @{NFT_SET_KNOCK4} {KNOCK_LOG_LIMIT} log prefix \"{KNOCK_LOG_OK}\" level info\n"
-        ));
+        if log {
+            s.push_str(&format!(
+                "        meta nfproto ipv4 {m} ip saddr != @{NFT_SET_KNOCK4} {KNOCK_LOG_LIMIT} log prefix \"{KNOCK_LOG_OK}\" level info\n"
+            ));
+        }
         s.push_str(&format!(
             "        meta nfproto ipv4 {m} update @{NFT_SET_KNOCK4} {{ ip saddr timeout {KNOCK_TTL_SECS}s }} drop\n"
         ));
-        s.push_str(&format!(
-            "        meta nfproto ipv6 {m} ip6 saddr != @{NFT_SET_KNOCK6} {KNOCK_LOG_LIMIT} log prefix \"{KNOCK_LOG_OK}\" level info\n"
-        ));
+        if log {
+            s.push_str(&format!(
+                "        meta nfproto ipv6 {m} ip6 saddr != @{NFT_SET_KNOCK6} {KNOCK_LOG_LIMIT} log prefix \"{KNOCK_LOG_OK}\" level info\n"
+            ));
+        }
         s.push_str(&format!(
             "        meta nfproto ipv6 {m} update @{NFT_SET_KNOCK6} {{ ip6 saddr timeout {KNOCK_TTL_SECS}s }} drop\n"
         ));
         // 口令对的包上面已丢弃；到这里的 16 字节载荷包按敲错记（多为重置 access key 后没重新配对的设备）。
-        s.push_str(&format!(
-            "        udp dport {} udp length 24 {KNOCK_LOG_LIMIT} log prefix \"{KNOCK_LOG_BAD}\" level info\n",
-            k.port
-        ));
+        if log {
+            s.push_str(&format!(
+                "        udp dport {} udp length 24 {KNOCK_LOG_LIMIT} log prefix \"{KNOCK_LOG_BAD}\" level info\n",
+                k.port
+            ));
+        }
     }
     // SSH 管理端口（ADR 0007 唯一入口）。默认无条件放行（自锁不变量，最稳）；开启
     // ssh_allowlist_only 后去掉这条——SSH 改由下方 `ip saddr @allow accept` 命中（名单内源 IP），
@@ -185,7 +192,7 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
             "        # ssh dport {} 仅名单可连（见末尾 saddr 规则）\n",
             cfg.ssh_port
         ));
-        if knock.is_some() {
+        if knock.is_some() && log {
             s.push_str(&format!(
                 "        tcp dport {} ip saddr @{NFT_SET_KNOCK4} {KNOCK_LOG_LIMIT} log prefix \"{KNOCK_LOG_SSH}\" level info\n",
                 cfg.ssh_port
@@ -194,6 +201,8 @@ pub fn render_apply(cfg: &RulesetConfig, entries: &[Entry], now: DateTime<Utc>) 
                 "        tcp dport {} ip6 saddr @{NFT_SET_KNOCK6} {KNOCK_LOG_LIMIT} log prefix \"{KNOCK_LOG_SSH}\" level info\n",
                 cfg.ssh_port
             ));
+        }
+        if knock.is_some() {
             s.push_str(&format!(
                 "        tcp dport {} ip saddr @{NFT_SET_KNOCK4} accept\n",
                 cfg.ssh_port
@@ -449,6 +458,18 @@ mod tests {
         let ls6 = at(&format!("tcp dport 22 ip6 saddr @knock6 {lim} log prefix \"ipgate knock ssh: \" level info"));
         assert!(ls4 < s4 && ls6 < s6);
         assert!(lines.iter().filter(|l| l.contains("log prefix")).all(|l| !l.ends_with("accept") && !l.ends_with("drop")));
+    }
+
+    #[test]
+    fn knock_without_log_keeps_knock_rules() {
+        // 日志被拒后的降级形态：敲门与经敲门放行 SSH 都在，只是没有日志规则。
+        let cfg = RulesetConfig { ssh_knock_log: false, ..knock_cfg(true) };
+        let s = render_apply(&cfg, &[], Utc::now());
+        assert!(!s.contains("log prefix"));
+        assert!(s.contains("update @knock4 { ip saddr timeout 60s } drop"));
+        assert!(s.contains("update @knock6 { ip6 saddr timeout 60s } drop"));
+        assert!(s.contains("tcp dport 22 ip saddr @knock4 accept"));
+        assert!(s.contains("tcp dport 22 ip6 saddr @knock6 accept"));
     }
 
     #[test]
